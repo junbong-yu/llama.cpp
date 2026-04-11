@@ -12,10 +12,10 @@ index b313a73..5b22f47 100644
      log.cpp
      log.h
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 3d0183e..4ea7d5d 100644
+index 3d0183e..ff4e2df 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -3709,6 +3709,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -3709,6 +3709,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.tensor_filter.push_back(value);
          }
      ).set_examples({LLAMA_EXAMPLE_DEBUG}));
@@ -45,9 +45,10 @@ index 3d0183e..4ea7d5d 100644
 +    ));
 +    add_opt(common_arg(
 +        {"--layer-values-csv"}, "DIR",
-+        "write one CSV file per layer (layer_<il>.csv) with 300 randomly "
-+        "sampled output values to DIR; sampling uses a seed derived from "
-+        "the current hour and draws 300 uniform indices per layer",
++        "write one CSV file per layer (layer_<il>.csv) with up to 300 "
++        "randomly sampled output values to DIR; sampling uses a seed "
++        "derived from the current hour and draws unique indices. If a "
++        "layer output has fewer than 300 elements, all values are dumped.",
 +        [](common_params & params, const std::string & value) {
 +            params.layer_values_csv_dir = value;
 +        }
@@ -97,10 +98,10 @@ index 020b6a7..db35092 100644
      std::vector<llama_model_kv_override> kv_overrides;
 diff --git a/common/layer-profile.cpp b/common/layer-profile.cpp
 new file mode 100644
-index 0000000..f2df281
+index 0000000..7367cc8
 --- /dev/null
 +++ b/common/layer-profile.cpp
-@@ -0,0 +1,476 @@
+@@ -0,0 +1,498 @@
 +#include "layer-profile.h"
 +
 +#include "common.h"
@@ -124,6 +125,7 @@ index 0000000..f2df281
 +#include <limits>
 +#include <memory>
 +#include <random>
++#include <unordered_set>
 +
 +using json = nlohmann::ordered_json;
 +
@@ -202,9 +204,15 @@ index 0000000..f2df281
 +    return (uint64_t) local_tm.tm_hour;
 +}
 +
-+// Draw `n_samples` random indices uniformly in [0, n_elements) using
-+// `seed`. Duplicates are permitted: the goal is to have exactly
-+// `n_samples` rows in the CSV for every layer.
++// Build the list of tensor positions that will be dumped to CSV for a
++// given layer.
++//
++//   - If the tensor has <= n_samples elements, every position is kept
++//     in natural order (no randomness is needed or useful).
++//   - Otherwise, draw n_samples *unique* indices uniformly from
++//     [0, n_elements) with rejection sampling. Duplicates are not
++//     permitted, so every CSV row corresponds to a distinct tensor
++//     position.
 +static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
 +                                                uint64_t seed,
 +                                                int      n_samples) {
@@ -212,13 +220,28 @@ index 0000000..f2df281
 +        return {};
 +    }
 +
++    if (n_elements <= (int64_t) n_samples) {
++        std::vector<int64_t> all;
++        all.reserve((size_t) n_elements);
++        for (int64_t i = 0; i < n_elements; ++i) {
++            all.push_back(i);
++        }
++        return all;
++    }
++
 +    std::mt19937_64                        rng(seed);
 +    std::uniform_int_distribution<int64_t> dist(0, n_elements - 1);
 +
-+    std::vector<int64_t> picked;
++    std::vector<int64_t>        picked;
++    std::unordered_set<int64_t> seen;
 +    picked.reserve((size_t) n_samples);
-+    for (int i = 0; i < n_samples; ++i) {
-+        picked.push_back(dist(rng));
++    seen.reserve((size_t) n_samples);
++
++    while ((int) picked.size() < n_samples) {
++        const int64_t idx = dist(rng);
++        if (seen.insert(idx).second) {
++            picked.push_back(idx);
++        }
 +    }
 +    return picked;
 +}
@@ -700,10 +723,10 @@ index 0000000..6a57254
 +bool common_layer_profiler_cb_eval(ggml_tensor * t, bool ask, void * user_data);
 diff --git a/docs/layer-profile-schema.md b/docs/layer-profile-schema.md
 new file mode 100644
-index 0000000..23b4215
+index 0000000..a9990e5
 --- /dev/null
 +++ b/docs/layer-profile-schema.md
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,268 @@
 +# Layer Profile Schema (`layer-profile/v1`)
 +
 +This document specifies a **unified JSON format** for per-layer inference
@@ -904,7 +927,7 @@ index 0000000..23b4215
 +
 +For every transformer layer observed, the producer writes a file
 +`<DIR>/layer_<il>.csv` (3-digit zero-padded `il`) with exactly two
-+columns and exactly **300** data rows:
++columns and up to **300** data rows:
 +
 +```
 +index,value
@@ -916,7 +939,9 @@ index 0000000..23b4215
 +- `index` is the flattened row-major offset into the layer's output
 +  tensor (`l_out-<il>`).
 +- `value` is the dequantized `f32` value at that offset.
-+- Row order matches the order in which indices were drawn from the RNG.
++- Row order matches the order in which indices were drawn from the RNG
++  (or natural `0..n_elements-1` order when the tensor is small, see
++  below).
 +
 +**Sampling procedure.** The producer:
 +
@@ -925,11 +950,16 @@ index 0000000..23b4215
 +   in the same clock hour therefore reuse the same sample positions,
 +   which makes CSV outputs directly diffable between nearby runs on the
 +   same model.
-+2. Uses the seed to draw exactly `n_samples = 300` indices uniformly
-+   from `[0, n_elements)` with a 64-bit Mersenne Twister
-+   (`std::mt19937_64`). Duplicates are permitted so that every layer
-+   CSV has exactly 300 rows regardless of the tensor size.
-+3. On every forward pass, re-reads the layer output at those positions
++2. **Small-tensor fallback.** If the layer output tensor has fewer than
++   or equal to `n_samples = 300` elements, the producer skips the RNG
++   entirely and emits every position `0..n_elements-1` in natural
++   order. The CSV has exactly `n_elements` data rows in that case.
++3. **Otherwise**, uses the seed to draw `n_samples` **unique** indices
++   uniformly from `[0, n_elements)` with a 64-bit Mersenne Twister
++   (`std::mt19937_64`) and rejection sampling (redraw on collision).
++   Every row in the resulting CSV corresponds to a distinct tensor
++   position.
++4. On every forward pass, re-reads the layer output at those positions
 +   and overwrites the stored values, so the final CSV reflects the last
 +   observed forward pass.
 +
@@ -943,8 +973,10 @@ index 0000000..23b4215
 +For another engine to produce a compatible `layer_<il>.csv`:
 +
 +- It MUST use the same draw procedure: seed = current local hour, RNG =
-+  `std::mt19937_64`, 300 uniform integers drawn in `[0, n_elements)`
-+  with duplicates permitted, in draw order.
++  `std::mt19937_64`. When `n_elements > 300`, draw 300 **unique**
++  indices in `[0, n_elements)` via rejection sampling, in draw order.
++  When `n_elements <= 300`, emit the natural range
++  `0..n_elements-1` in order.
 +- It MUST use flattened row-major indices into a tensor of the same
 +  `shape` as the corresponding JSON layer object.
 +- It MUST emit the header row literally as `index,value` and use a plain

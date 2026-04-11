@@ -198,7 +198,7 @@ the same run.
 
 For every transformer layer observed, the producer writes a file
 `<DIR>/layer_<il>.csv` (3-digit zero-padded `il`) with exactly two
-columns and exactly **300** data rows:
+columns and up to **300** data rows:
 
 ```
 index,value
@@ -210,7 +210,9 @@ index,value
 - `index` is the flattened row-major offset into the layer's output
   tensor (`l_out-<il>`).
 - `value` is the dequantized `f32` value at that offset.
-- Row order matches the order in which indices were drawn from the RNG.
+- Row order matches the order in which indices were drawn from the RNG
+  (or natural `0..n_elements-1` order when the tensor is small, see
+  below).
 
 **Sampling procedure.** The producer:
 
@@ -219,11 +221,16 @@ index,value
    in the same clock hour therefore reuse the same sample positions,
    which makes CSV outputs directly diffable between nearby runs on the
    same model.
-2. Uses the seed to draw exactly `n_samples = 300` indices uniformly
-   from `[0, n_elements)` with a 64-bit Mersenne Twister
-   (`std::mt19937_64`). Duplicates are permitted so that every layer
-   CSV has exactly 300 rows regardless of the tensor size.
-3. On every forward pass, re-reads the layer output at those positions
+2. **Small-tensor fallback.** If the layer output tensor has fewer than
+   or equal to `n_samples = 300` elements, the producer skips the RNG
+   entirely and emits every position `0..n_elements-1` in natural
+   order. The CSV has exactly `n_elements` data rows in that case.
+3. **Otherwise**, uses the seed to draw `n_samples` **unique** indices
+   uniformly from `[0, n_elements)` with a 64-bit Mersenne Twister
+   (`std::mt19937_64`) and rejection sampling (redraw on collision).
+   Every row in the resulting CSV corresponds to a distinct tensor
+   position.
+4. On every forward pass, re-reads the layer output at those positions
    and overwrites the stored values, so the final CSV reflects the last
    observed forward pass.
 
@@ -237,8 +244,10 @@ diffs are straightforward.
 For another engine to produce a compatible `layer_<il>.csv`:
 
 - It MUST use the same draw procedure: seed = current local hour, RNG =
-  `std::mt19937_64`, 300 uniform integers drawn in `[0, n_elements)`
-  with duplicates permitted, in draw order.
+  `std::mt19937_64`. When `n_elements > 300`, draw 300 **unique**
+  indices in `[0, n_elements)` via rejection sampling, in draw order.
+  When `n_elements <= 300`, emit the natural range
+  `0..n_elements-1` in order.
 - It MUST use flattened row-major indices into a tensor of the same
   `shape` as the corresponding JSON layer object.
 - It MUST emit the header row literally as `index,value` and use a plain

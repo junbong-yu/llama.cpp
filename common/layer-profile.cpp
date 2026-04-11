@@ -21,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <random>
+#include <unordered_set>
 
 using json = nlohmann::ordered_json;
 
@@ -99,9 +100,15 @@ static uint64_t current_hour_seed() {
     return (uint64_t) local_tm.tm_hour;
 }
 
-// Draw `n_samples` random indices uniformly in [0, n_elements) using
-// `seed`. Duplicates are permitted: the goal is to have exactly
-// `n_samples` rows in the CSV for every layer.
+// Build the list of tensor positions that will be dumped to CSV for a
+// given layer.
+//
+//   - If the tensor has <= n_samples elements, every position is kept
+//     in natural order (no randomness is needed or useful).
+//   - Otherwise, draw n_samples *unique* indices uniformly from
+//     [0, n_elements) with rejection sampling. Duplicates are not
+//     permitted, so every CSV row corresponds to a distinct tensor
+//     position.
 static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
                                                 uint64_t seed,
                                                 int      n_samples) {
@@ -109,13 +116,28 @@ static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
         return {};
     }
 
+    if (n_elements <= (int64_t) n_samples) {
+        std::vector<int64_t> all;
+        all.reserve((size_t) n_elements);
+        for (int64_t i = 0; i < n_elements; ++i) {
+            all.push_back(i);
+        }
+        return all;
+    }
+
     std::mt19937_64                        rng(seed);
     std::uniform_int_distribution<int64_t> dist(0, n_elements - 1);
 
-    std::vector<int64_t> picked;
+    std::vector<int64_t>        picked;
+    std::unordered_set<int64_t> seen;
     picked.reserve((size_t) n_samples);
-    for (int i = 0; i < n_samples; ++i) {
-        picked.push_back(dist(rng));
+    seen.reserve((size_t) n_samples);
+
+    while ((int) picked.size() < n_samples) {
+        const int64_t idx = dist(rng);
+        if (seen.insert(idx).second) {
+            picked.push_back(idx);
+        }
     }
     return picked;
 }

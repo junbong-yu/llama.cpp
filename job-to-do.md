@@ -140,9 +140,10 @@ the accumulated data to the configured JSON path using `nlohmann::json`
     layer profile JSON (default: 8)
 
 --layer-values-csv DIR
-    write one CSV file per layer (layer_<il>.csv) with 300 randomly
-    sampled output values to DIR; sampling uses a seed derived from
-    the current hour and draws 300 uniform indices per layer
+    write one CSV file per layer (layer_<il>.csv) with up to 300
+    randomly sampled output values to DIR; sampling uses a seed
+    derived from the current hour and draws unique indices. If a
+    layer output has fewer than 300 elements, all values are dumped.
 ```
 
 Because the flags are attached to the default example group (i.e. no
@@ -179,15 +180,17 @@ may be used on the same run — they are independent outputs.
 
 - RNG seed = current local hour (`localtime(now).tm_hour`, range 0..23).
 - RNG = `std::mt19937_64` seeded with that value.
-- Draw exactly **300** indices uniformly from `[0, n_elements)` for the
-  layer's output tensor. Duplicates are permitted so that every layer's
-  CSV has exactly 300 rows regardless of tensor size.
+- If the layer output has `<= 300` elements, every position is dumped
+  in natural `0..n_elements-1` order (no RNG involved).
+- Otherwise, draw **300 unique** indices uniformly from
+  `[0, n_elements)` via rejection sampling (redraw on collision). Every
+  CSV row corresponds to a distinct tensor position.
 - The index list is generated once per layer on the first output
   observation and cached on the layer entry, so subsequent forward
   passes reuse the same indices.
-- On every forward pass, the values at those 300 positions are re-read
-  from the tensor and overwritten in the profiler state, so the final
-  CSV reflects the **last** observed forward pass.
+- On every forward pass, the values at those positions are re-read from
+  the tensor and overwritten in the profiler state, so the final CSV
+  reflects the **last** observed forward pass.
 
 The `csv_n_samples` knob lives on `layer_profile_config` if a reviewer
 wants to tweak the sample count without touching the callsite.
@@ -204,7 +207,8 @@ DIR/
     layer_031.csv
 ```
 
-Each file contains exactly one header row plus exactly 300 data rows:
+Each file contains exactly one header row plus up to 300 data rows
+(`min(n_elements, 300)` exactly):
 
 ```
 index,value
