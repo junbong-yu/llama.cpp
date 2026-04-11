@@ -480,6 +480,11 @@ struct common_params {
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT
 
+    // layer profiler (see common/layer-profile.h and docs/layer-profile-schema.md)
+    std::string layer_profile_path      = ""; // output JSON path; empty = profiler disabled                // NOLINT
+    bool        layer_profile_full      = false; // dump full layer output values (large!)
+    int         layer_profile_samples   = 8;     // number of head/tail sample values to record
+
     std::vector<std::string> in_files;   // all input files
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;

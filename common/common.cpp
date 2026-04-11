@@ -2,6 +2,7 @@
 #include "gguf.h"
 
 #include "common.h"
+#include "layer-profile.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1265,6 +1266,10 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params) {
+    // Must run before the llama_context is created so that cb_eval is
+    // propagated through llama_context_params_from_params -> cparams.
+    common_layer_profiler_install(params);
+
     common_init_result_ptr res(new common_init_result(params));
 
     llama_model * model = res->model();
