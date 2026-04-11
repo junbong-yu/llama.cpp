@@ -210,9 +210,8 @@ index,value
 - `index` is the flattened row-major offset into the layer's output
   tensor (`l_out-<il>`).
 - `value` is the dequantized `f32` value at that offset.
-- Row order matches the order in which indices were drawn from the RNG
-  (or natural `0..n_elements-1` order when the tensor is small, see
-  below).
+- Rows are sorted in **ascending `index` order**, so two CSVs with the
+  same sample set line up row-by-row for easy `diff`ing.
 
 **Sampling procedure.** The producer:
 
@@ -228,9 +227,9 @@ index,value
 3. **Otherwise**, uses the seed to draw `n_samples` **unique** indices
    uniformly from `[0, n_elements)` with a 64-bit Mersenne Twister
    (`std::mt19937_64`) and rejection sampling (redraw on collision).
-   Every row in the resulting CSV corresponds to a distinct tensor
-   position.
-4. On every forward pass, re-reads the layer output at those positions
+4. Sorts the resulting index list in ascending order so the CSV rows
+   are line-by-line comparable between runs and between engines.
+5. On every forward pass, re-reads the layer output at those positions
    and overwrites the stored values, so the final CSV reflects the last
    observed forward pass.
 
@@ -245,9 +244,10 @@ For another engine to produce a compatible `layer_<il>.csv`:
 
 - It MUST use the same draw procedure: seed = current local hour, RNG =
   `std::mt19937_64`. When `n_elements > 300`, draw 300 **unique**
-  indices in `[0, n_elements)` via rejection sampling, in draw order.
-  When `n_elements <= 300`, emit the natural range
-  `0..n_elements-1` in order.
+  indices in `[0, n_elements)` via rejection sampling. When
+  `n_elements <= 300`, use the natural range `0..n_elements-1`.
+- It MUST sort the final index list in ascending order before writing
+  the CSV so rows align between producers.
 - It MUST use flattened row-major indices into a tensor of the same
   `shape` as the corresponding JSON layer object.
 - It MUST emit the header row literally as `index,value` and use a plain

@@ -185,6 +185,10 @@ may be used on the same run — they are independent outputs.
 - Otherwise, draw **300 unique** indices uniformly from
   `[0, n_elements)` via rejection sampling (redraw on collision). Every
   CSV row corresponds to a distinct tensor position.
+- The final index list is **sorted in ascending order** before the
+  first value is written, so every `layer_<il>.csv` has rows in
+  monotonically increasing `index` order and two runs can be diffed
+  line-by-line.
 - The index list is generated once per layer on the first output
   observation and cached on the layer entry, so subsequent forward
   passes reuse the same indices.

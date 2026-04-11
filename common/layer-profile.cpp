@@ -101,14 +101,13 @@ static uint64_t current_hour_seed() {
 }
 
 // Build the list of tensor positions that will be dumped to CSV for a
-// given layer.
+// given layer. The returned vector is sorted in ascending order so
+// that the resulting CSV is easy to diff line-by-line.
 //
 //   - If the tensor has <= n_samples elements, every position is kept
 //     in natural order (no randomness is needed or useful).
 //   - Otherwise, draw n_samples *unique* indices uniformly from
-//     [0, n_elements) with rejection sampling. Duplicates are not
-//     permitted, so every CSV row corresponds to a distinct tensor
-//     position.
+//     [0, n_elements) with rejection sampling and then sort them.
 static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
                                                 uint64_t seed,
                                                 int      n_samples) {
@@ -139,6 +138,8 @@ static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
             picked.push_back(idx);
         }
     }
+
+    std::sort(picked.begin(), picked.end());
     return picked;
 }
 

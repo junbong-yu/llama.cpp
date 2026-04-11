@@ -98,10 +98,10 @@ index 020b6a7..db35092 100644
      std::vector<llama_model_kv_override> kv_overrides;
 diff --git a/common/layer-profile.cpp b/common/layer-profile.cpp
 new file mode 100644
-index 0000000..7367cc8
+index 0000000..dbcb728
 --- /dev/null
 +++ b/common/layer-profile.cpp
-@@ -0,0 +1,498 @@
+@@ -0,0 +1,499 @@
 +#include "layer-profile.h"
 +
 +#include "common.h"
@@ -205,14 +205,13 @@ index 0000000..7367cc8
 +}
 +
 +// Build the list of tensor positions that will be dumped to CSV for a
-+// given layer.
++// given layer. The returned vector is sorted in ascending order so
++// that the resulting CSV is easy to diff line-by-line.
 +//
 +//   - If the tensor has <= n_samples elements, every position is kept
 +//     in natural order (no randomness is needed or useful).
 +//   - Otherwise, draw n_samples *unique* indices uniformly from
-+//     [0, n_elements) with rejection sampling. Duplicates are not
-+//     permitted, so every CSV row corresponds to a distinct tensor
-+//     position.
++//     [0, n_elements) with rejection sampling and then sort them.
 +static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
 +                                                uint64_t seed,
 +                                                int      n_samples) {
@@ -243,6 +242,8 @@ index 0000000..7367cc8
 +            picked.push_back(idx);
 +        }
 +    }
++
++    std::sort(picked.begin(), picked.end());
 +    return picked;
 +}
 +
@@ -723,7 +724,7 @@ index 0000000..6a57254
 +bool common_layer_profiler_cb_eval(ggml_tensor * t, bool ask, void * user_data);
 diff --git a/docs/layer-profile-schema.md b/docs/layer-profile-schema.md
 new file mode 100644
-index 0000000..a9990e5
+index 0000000..875e119
 --- /dev/null
 +++ b/docs/layer-profile-schema.md
 @@ -0,0 +1,268 @@
@@ -939,9 +940,8 @@ index 0000000..a9990e5
 +- `index` is the flattened row-major offset into the layer's output
 +  tensor (`l_out-<il>`).
 +- `value` is the dequantized `f32` value at that offset.
-+- Row order matches the order in which indices were drawn from the RNG
-+  (or natural `0..n_elements-1` order when the tensor is small, see
-+  below).
++- Rows are sorted in **ascending `index` order**, so two CSVs with the
++  same sample set line up row-by-row for easy `diff`ing.
 +
 +**Sampling procedure.** The producer:
 +
@@ -957,9 +957,9 @@ index 0000000..a9990e5
 +3. **Otherwise**, uses the seed to draw `n_samples` **unique** indices
 +   uniformly from `[0, n_elements)` with a 64-bit Mersenne Twister
 +   (`std::mt19937_64`) and rejection sampling (redraw on collision).
-+   Every row in the resulting CSV corresponds to a distinct tensor
-+   position.
-+4. On every forward pass, re-reads the layer output at those positions
++4. Sorts the resulting index list in ascending order so the CSV rows
++   are line-by-line comparable between runs and between engines.
++5. On every forward pass, re-reads the layer output at those positions
 +   and overwrites the stored values, so the final CSV reflects the last
 +   observed forward pass.
 +
@@ -974,9 +974,10 @@ index 0000000..a9990e5
 +
 +- It MUST use the same draw procedure: seed = current local hour, RNG =
 +  `std::mt19937_64`. When `n_elements > 300`, draw 300 **unique**
-+  indices in `[0, n_elements)` via rejection sampling, in draw order.
-+  When `n_elements <= 300`, emit the natural range
-+  `0..n_elements-1` in order.
++  indices in `[0, n_elements)` via rejection sampling. When
++  `n_elements <= 300`, use the natural range `0..n_elements-1`.
++- It MUST sort the final index list in ascending order before writing
++  the CSV so rows align between producers.
 +- It MUST use flattened row-major indices into a tensor of the same
 +  `shape` as the corresponding JSON layer object.
 +- It MUST emit the header row literally as `index,value` and use a plain
