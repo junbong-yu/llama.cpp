@@ -33,8 +33,8 @@ The work is delivered as:
 
 | File | Change |
 | ---- | ------ |
-| `common/common.h` | Added three fields on `common_params`: `layer_profile_path`, `layer_profile_full`, `layer_profile_samples`. |
-| `common/arg.cpp` | Registered three new CLI flags: `--layer-profile`, `--layer-profile-full`, `--layer-profile-samples`. |
+| `common/common.h` | Added four fields on `common_params`: `layer_profile_path`, `layer_profile_full`, `layer_profile_samples`, `layer_values_csv_dir`. |
+| `common/arg.cpp` | Registered four new CLI flags: `--layer-profile`, `--layer-profile-full`, `--layer-profile-samples`, `--layer-values-csv`. |
 | `common/common.cpp` | Call `common_layer_profiler_install(params)` at the top of `common_init_from_params`, before the `llama_context` is constructed. |
 | `common/CMakeLists.txt` | Added `layer-profile.cpp` / `layer-profile.h` to the `common` static library. |
 
@@ -84,7 +84,7 @@ keeps the statistics of the most recent output.
 
 ### 4.3 Statistics captured per layer output
 
-Implemented in `compute_stats()` in `common/layer-profile.cpp`:
+Implemented in `capture_layer_output()` in `common/layer-profile.cpp`:
 
 - `shape` — `ne[0..3]`.
 - `dtype` — the ggml type name (`f32`, `f16`, `bf16`, `q4_0`, ...).
@@ -113,7 +113,8 @@ the `llama_context`. This is important: `cb_eval` must be set on
 `common_params` before it is copied into `llama_context_params` and stored
 on the context. The install function:
 
-1. No-ops if `params.layer_profile_path` is empty.
+1. No-ops if both `params.layer_profile_path` and
+   `params.layer_values_csv_dir` are empty.
 2. Allocates a singleton `layer_profiler` held in a file-static
    `std::unique_ptr`.
 3. Sets `params.cb_eval` to the profiler callback and
