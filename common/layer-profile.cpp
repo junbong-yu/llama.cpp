@@ -21,7 +21,6 @@
 #include <limits>
 #include <memory>
 #include <random>
-#include <unordered_set>
 
 using json = nlohmann::ordered_json;
 
@@ -100,31 +99,23 @@ static uint64_t current_hour_seed() {
     return (uint64_t) local_tm.tm_hour;
 }
 
-// Generate `pool_size` random indices in [0, n_elements) using `seed` and
-// return up to `pick` unique indices from that pool, in the order they
-// were drawn. If dedup within the pool yields fewer than `pick` indices,
-// the result is shorter.
+// Draw `n_samples` random indices uniformly in [0, n_elements) using
+// `seed`. Duplicates are permitted: the goal is to have exactly
+// `n_samples` rows in the CSV for every layer.
 static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
                                                 uint64_t seed,
-                                                int      pool_size,
-                                                int      pick) {
-    if (n_elements <= 0 || pool_size <= 0 || pick <= 0) {
+                                                int      n_samples) {
+    if (n_elements <= 0 || n_samples <= 0) {
         return {};
     }
 
     std::mt19937_64                        rng(seed);
     std::uniform_int_distribution<int64_t> dist(0, n_elements - 1);
 
-    std::vector<int64_t>        picked;
-    std::unordered_set<int64_t> seen;
-    picked.reserve((size_t) pick);
-    seen.reserve((size_t) pool_size);
-
-    for (int i = 0; i < pool_size && (int) picked.size() < pick; ++i) {
-        const int64_t idx = dist(rng);
-        if (seen.insert(idx).second) {
-            picked.push_back(idx);
-        }
+    std::vector<int64_t> picked;
+    picked.reserve((size_t) n_samples);
+    for (int i = 0; i < n_samples; ++i) {
+        picked.push_back(dist(rng));
     }
     return picked;
 }
@@ -228,7 +219,7 @@ static void capture_layer_output(const ggml_tensor          * t,
     if (!cfg.csv_dir.empty()) {
         if (e.csv_indices.empty()) {
             e.csv_indices = make_sample_indices(
-                s.n_elements, csv_seed, cfg.csv_pool_size, cfg.csv_pick);
+                s.n_elements, csv_seed, cfg.csv_n_samples);
         }
         e.csv_values.clear();
         e.csv_values.reserve(e.csv_indices.size());

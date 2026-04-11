@@ -12,7 +12,7 @@ index b313a73..5b22f47 100644
      log.cpp
      log.h
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 3d0183e..5d027cf 100644
+index 3d0183e..4ea7d5d 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -3709,6 +3709,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -45,9 +45,9 @@ index 3d0183e..5d027cf 100644
 +    ));
 +    add_opt(common_arg(
 +        {"--layer-values-csv"}, "DIR",
-+        "write one CSV file per layer (layer_<il>.csv) with 1000 randomly "
++        "write one CSV file per layer (layer_<il>.csv) with 300 randomly "
 +        "sampled output values to DIR; sampling uses a seed derived from "
-+        "the current hour, draws 3000 candidate indices and keeps 1000",
++        "the current hour and draws 300 uniform indices per layer",
 +        [](common_params & params, const std::string & value) {
 +            params.layer_values_csv_dir = value;
 +        }
@@ -97,10 +97,10 @@ index 020b6a7..db35092 100644
      std::vector<llama_model_kv_override> kv_overrides;
 diff --git a/common/layer-profile.cpp b/common/layer-profile.cpp
 new file mode 100644
-index 0000000..9495aef
+index 0000000..f2df281
 --- /dev/null
 +++ b/common/layer-profile.cpp
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,476 @@
 +#include "layer-profile.h"
 +
 +#include "common.h"
@@ -124,7 +124,6 @@ index 0000000..9495aef
 +#include <limits>
 +#include <memory>
 +#include <random>
-+#include <unordered_set>
 +
 +using json = nlohmann::ordered_json;
 +
@@ -203,31 +202,23 @@ index 0000000..9495aef
 +    return (uint64_t) local_tm.tm_hour;
 +}
 +
-+// Generate `pool_size` random indices in [0, n_elements) using `seed` and
-+// return up to `pick` unique indices from that pool, in the order they
-+// were drawn. If dedup within the pool yields fewer than `pick` indices,
-+// the result is shorter.
++// Draw `n_samples` random indices uniformly in [0, n_elements) using
++// `seed`. Duplicates are permitted: the goal is to have exactly
++// `n_samples` rows in the CSV for every layer.
 +static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
 +                                                uint64_t seed,
-+                                                int      pool_size,
-+                                                int      pick) {
-+    if (n_elements <= 0 || pool_size <= 0 || pick <= 0) {
++                                                int      n_samples) {
++    if (n_elements <= 0 || n_samples <= 0) {
 +        return {};
 +    }
 +
 +    std::mt19937_64                        rng(seed);
 +    std::uniform_int_distribution<int64_t> dist(0, n_elements - 1);
 +
-+    std::vector<int64_t>        picked;
-+    std::unordered_set<int64_t> seen;
-+    picked.reserve((size_t) pick);
-+    seen.reserve((size_t) pool_size);
-+
-+    for (int i = 0; i < pool_size && (int) picked.size() < pick; ++i) {
-+        const int64_t idx = dist(rng);
-+        if (seen.insert(idx).second) {
-+            picked.push_back(idx);
-+        }
++    std::vector<int64_t> picked;
++    picked.reserve((size_t) n_samples);
++    for (int i = 0; i < n_samples; ++i) {
++        picked.push_back(dist(rng));
 +    }
 +    return picked;
 +}
@@ -331,7 +322,7 @@ index 0000000..9495aef
 +    if (!cfg.csv_dir.empty()) {
 +        if (e.csv_indices.empty()) {
 +            e.csv_indices = make_sample_indices(
-+                s.n_elements, csv_seed, cfg.csv_pool_size, cfg.csv_pick);
++                s.n_elements, csv_seed, cfg.csv_n_samples);
 +        }
 +        e.csv_values.clear();
 +        e.csv_values.reserve(e.csv_indices.size());
@@ -588,10 +579,10 @@ index 0000000..9495aef
 +}
 diff --git a/common/layer-profile.h b/common/layer-profile.h
 new file mode 100644
-index 0000000..414d31d
+index 0000000..6a57254
 --- /dev/null
 +++ b/common/layer-profile.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,115 @@
 +#pragma once
 +
 +// Per-layer inference profiler for llama.cpp.
@@ -623,13 +614,12 @@ index 0000000..414d31d
 +    int         n_sample_values  = 8;
 +
 +    // Directory for per-layer CSV dumps. When non-empty the profiler
-+    // writes `<csv_dir>/layer_<il>.csv` with 1000 randomly sampled
-+    // (index,value) pairs for each layer. Sampling uses a seed derived
-+    // from the current hour so that multiple runs within the same hour
-+    // pick the same indices.
++    // writes `<csv_dir>/layer_<il>.csv` with `csv_n_samples` randomly
++    // sampled (index,value) pairs for each layer. Sampling uses a seed
++    // derived from the current hour so that multiple runs within the
++    // same hour pick the same indices.
 +    std::string csv_dir;
-+    int         csv_pool_size    = 3000;
-+    int         csv_pick         = 1000;
++    int         csv_n_samples    = 300;
 +
 +    std::string engine_name      = "llama.cpp";
 +    std::string engine_version;
@@ -710,10 +700,10 @@ index 0000000..414d31d
 +bool common_layer_profiler_cb_eval(ggml_tensor * t, bool ask, void * user_data);
 diff --git a/docs/layer-profile-schema.md b/docs/layer-profile-schema.md
 new file mode 100644
-index 0000000..a77af55
+index 0000000..23b4215
 --- /dev/null
 +++ b/docs/layer-profile-schema.md
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,259 @@
 +# Layer Profile Schema (`layer-profile/v1`)
 +
 +This document specifies a **unified JSON format** for per-layer inference
@@ -914,7 +904,7 @@ index 0000000..a77af55
 +
 +For every transformer layer observed, the producer writes a file
 +`<DIR>/layer_<il>.csv` (3-digit zero-padded `il`) with exactly two
-+columns:
++columns and exactly **300** data rows:
 +
 +```
 +index,value
@@ -931,18 +921,16 @@ index 0000000..a77af55
 +**Sampling procedure.** The producer:
 +
 +1. Derives a RNG seed from the current local hour
-+   (`localtime(now).tm_hour`, range `0..23`). This means that two
-+   profiling runs started in the same clock hour reuse the same sample
-+   positions, which makes diffing cheap and makes CSV outputs reproducible
-+   between nearby runs on the same model.
-+2. Uses the seed to draw a pool of `pool_size = 3000` candidate indices
-+   uniformly from `[0, n_elements)` with a 64-bit Mersenne Twister.
-+3. Dedupes the pool in draw order and keeps the first `pick = 1000`
-+   unique indices. If the pool happens to contain fewer than 1000 unique
-+   values (extremely rare for any tensor larger than ~10k elements), the
-+   file is shorter.
-+4. On every forward pass, re-reads the layer output at those positions
-+   and overwrites `csv_values`, so the final CSV reflects the last
++   (`localtime(now).tm_hour`, range `0..23`). Two profiling runs started
++   in the same clock hour therefore reuse the same sample positions,
++   which makes CSV outputs directly diffable between nearby runs on the
++   same model.
++2. Uses the seed to draw exactly `n_samples = 300` indices uniformly
++   from `[0, n_elements)` with a 64-bit Mersenne Twister
++   (`std::mt19937_64`). Duplicates are permitted so that every layer
++   CSV has exactly 300 rows regardless of the tensor size.
++3. On every forward pass, re-reads the layer output at those positions
++   and overwrites the stored values, so the final CSV reflects the last
 +   observed forward pass.
 +
 +Consumers that want to cross-check two engines can use the CSV files
@@ -955,8 +943,8 @@ index 0000000..a77af55
 +For another engine to produce a compatible `layer_<il>.csv`:
 +
 +- It MUST use the same draw procedure: seed = current local hour, RNG =
-+  `std::mt19937_64`, candidate pool of 3000 uniform integers in
-+  `[0, n_elements)`, keep first 1000 unique in draw order.
++  `std::mt19937_64`, 300 uniform integers drawn in `[0, n_elements)`
++  with duplicates permitted, in draw order.
 +- It MUST use flattened row-major indices into a tensor of the same
 +  `shape` as the corresponding JSON layer object.
 +- It MUST emit the header row literally as `index,value` and use a plain

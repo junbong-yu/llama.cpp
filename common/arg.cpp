@@ -3735,9 +3735,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--layer-values-csv"}, "DIR",
-        "write one CSV file per layer (layer_<il>.csv) with 1000 randomly "
+        "write one CSV file per layer (layer_<il>.csv) with 300 randomly "
         "sampled output values to DIR; sampling uses a seed derived from "
-        "the current hour, draws 3000 candidate indices and keeps 1000",
+        "the current hour and draws 300 uniform indices per layer",
         [](common_params & params, const std::string & value) {
             params.layer_values_csv_dir = value;
         }

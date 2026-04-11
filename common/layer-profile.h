@@ -29,13 +29,12 @@ struct layer_profile_config {
     int         n_sample_values  = 8;
 
     // Directory for per-layer CSV dumps. When non-empty the profiler
-    // writes `<csv_dir>/layer_<il>.csv` with 1000 randomly sampled
-    // (index,value) pairs for each layer. Sampling uses a seed derived
-    // from the current hour so that multiple runs within the same hour
-    // pick the same indices.
+    // writes `<csv_dir>/layer_<il>.csv` with `csv_n_samples` randomly
+    // sampled (index,value) pairs for each layer. Sampling uses a seed
+    // derived from the current hour so that multiple runs within the
+    // same hour pick the same indices.
     std::string csv_dir;
-    int         csv_pool_size    = 3000;
-    int         csv_pick         = 1000;
+    int         csv_n_samples    = 300;
 
     std::string engine_name      = "llama.cpp";
     std::string engine_version;

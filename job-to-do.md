@@ -140,9 +140,9 @@ the accumulated data to the configured JSON path using `nlohmann::json`
     layer profile JSON (default: 8)
 
 --layer-values-csv DIR
-    write one CSV file per layer (layer_<il>.csv) with 1000 randomly
+    write one CSV file per layer (layer_<il>.csv) with 300 randomly
     sampled output values to DIR; sampling uses a seed derived from
-    the current hour, draws 3000 candidate indices and keeps 1000
+    the current hour and draws 300 uniform indices per layer
 ```
 
 Because the flags are attached to the default example group (i.e. no
@@ -179,18 +179,18 @@ may be used on the same run — they are independent outputs.
 
 - RNG seed = current local hour (`localtime(now).tm_hour`, range 0..23).
 - RNG = `std::mt19937_64` seeded with that value.
-- Draw a pool of **3000** candidate indices uniformly from
-  `[0, n_elements)` for the layer's output tensor.
-- Dedupe in draw order and keep the first **1000** unique indices.
+- Draw exactly **300** indices uniformly from `[0, n_elements)` for the
+  layer's output tensor. Duplicates are permitted so that every layer's
+  CSV has exactly 300 rows regardless of tensor size.
 - The index list is generated once per layer on the first output
   observation and cached on the layer entry, so subsequent forward
   passes reuse the same indices.
-- On every forward pass, the values at those 1000 positions are
-  re-read from the tensor and overwritten in the profiler state, so
-  the final CSV reflects the **last** observed forward pass.
+- On every forward pass, the values at those 300 positions are re-read
+  from the tensor and overwritten in the profiler state, so the final
+  CSV reflects the **last** observed forward pass.
 
-The `csv_pool_size` and `csv_pick` knobs live on `layer_profile_config`
-if a reviewer wants to tweak them without touching the callsite.
+The `csv_n_samples` knob lives on `layer_profile_config` if a reviewer
+wants to tweak the sample count without touching the callsite.
 
 ### File layout
 
@@ -204,7 +204,7 @@ DIR/
     layer_031.csv
 ```
 
-Each file contains exactly one header row plus up to 1000 data rows:
+Each file contains exactly one header row plus exactly 300 data rows:
 
 ```
 index,value
@@ -227,7 +227,7 @@ Using the current hour as a seed means:
   specific positions still have a chance of being hit.
 
 This matches the sampling strategy the user explicitly asked for
-(pool of 3000, keep 1000) and is documented in the schema doc
+(300 uniform indices per layer) and is documented in the schema doc
 (`docs/layer-profile-schema.md` §5) so other engines can reproduce
 the exact same sampling.
 
