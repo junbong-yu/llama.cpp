@@ -138,6 +138,11 @@ the accumulated data to the configured JSON path using `nlohmann::json`
 --layer-profile-samples N
     number of head/tail sample values to record per layer output in the
     layer profile JSON (default: 8)
+
+--layer-values-csv DIR
+    write one CSV file per layer (layer_<il>.csv) with 1000 randomly
+    sampled output values to DIR; sampling uses a seed derived from
+    the current hour, draws 3000 candidate indices and keeps 1000
 ```
 
 Because the flags are attached to the default example group (i.e. no
@@ -156,6 +161,75 @@ Typical invocation:
 ```
 
 which produces `layer-profile.json` with the `layer-profile/v1` schema.
+
+## 4.6 Per-layer CSV value dumps (`--layer-values-csv`)
+
+Separately from the JSON profile, the profiler can write one CSV file
+per layer containing randomly sampled output values. This is enabled by
+a single new flag:
+
+```
+--layer-values-csv DIR
+```
+
+Either `--layer-profile` (JSON), `--layer-values-csv` (CSV), or both
+may be used on the same run — they are independent outputs.
+
+### Sampling procedure
+
+- RNG seed = current local hour (`localtime(now).tm_hour`, range 0..23).
+- RNG = `std::mt19937_64` seeded with that value.
+- Draw a pool of **3000** candidate indices uniformly from
+  `[0, n_elements)` for the layer's output tensor.
+- Dedupe in draw order and keep the first **1000** unique indices.
+- The index list is generated once per layer on the first output
+  observation and cached on the layer entry, so subsequent forward
+  passes reuse the same indices.
+- On every forward pass, the values at those 1000 positions are
+  re-read from the tensor and overwritten in the profiler state, so
+  the final CSV reflects the **last** observed forward pass.
+
+The `csv_pool_size` and `csv_pick` knobs live on `layer_profile_config`
+if a reviewer wants to tweak them without touching the callsite.
+
+### File layout
+
+For each observed layer, one file is written to `DIR`:
+
+```
+DIR/
+    layer_000.csv
+    layer_001.csv
+    ...
+    layer_031.csv
+```
+
+Each file contains exactly one header row plus up to 1000 data rows:
+
+```
+index,value
+17,0.4213
+91,-1.8809
+...
+```
+
+where `index` is the row-major flattened offset into the layer's output
+tensor and `value` is the dequantized `f32` value at that offset.
+
+### Seed rationale
+
+Using the current hour as a seed means:
+
+- Runs within the same hour pick the same indices → the CSV files are
+  directly diffable across runs without extra configuration.
+- Runs in different hours pick different indices → the sampled coverage
+  rotates across the tensor over time so that failures that depend on
+  specific positions still have a chance of being hit.
+
+This matches the sampling strategy the user explicitly asked for
+(pool of 3000, keep 1000) and is documented in the schema doc
+(`docs/layer-profile-schema.md` §5) so other engines can reproduce
+the exact same sampling.
 
 ## 5. Output schema (summary)
 

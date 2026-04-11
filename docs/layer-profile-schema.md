@@ -189,7 +189,68 @@ concrete implementation (≈ 330 lines).
 
 ---
 
-## 5. Versioning
+## 5. Side-channel: per-layer CSV value dumps
+
+In addition to the JSON profile, the llama.cpp producer can emit a
+separate per-layer CSV dump triggered by `--layer-values-csv DIR`. This is
+independent of the JSON output: either, both or neither may be enabled on
+the same run.
+
+For every transformer layer observed, the producer writes a file
+`<DIR>/layer_<il>.csv` (3-digit zero-padded `il`) with exactly two
+columns:
+
+```
+index,value
+17,0.4213
+91,-1.8809
+...
+```
+
+- `index` is the flattened row-major offset into the layer's output
+  tensor (`l_out-<il>`).
+- `value` is the dequantized `f32` value at that offset.
+- Row order matches the order in which indices were drawn from the RNG.
+
+**Sampling procedure.** The producer:
+
+1. Derives a RNG seed from the current local hour
+   (`localtime(now).tm_hour`, range `0..23`). This means that two
+   profiling runs started in the same clock hour reuse the same sample
+   positions, which makes diffing cheap and makes CSV outputs reproducible
+   between nearby runs on the same model.
+2. Uses the seed to draw a pool of `pool_size = 3000` candidate indices
+   uniformly from `[0, n_elements)` with a 64-bit Mersenne Twister.
+3. Dedupes the pool in draw order and keeps the first `pick = 1000`
+   unique indices. If the pool happens to contain fewer than 1000 unique
+   values (extremely rare for any tensor larger than ~10k elements), the
+   file is shorter.
+4. On every forward pass, re-reads the layer output at those positions
+   and overwrites `csv_values`, so the final CSV reflects the last
+   observed forward pass.
+
+Consumers that want to cross-check two engines can use the CSV files
+directly: given that both engines sampled the same indices (because the
+schema below is reproducible across engines that follow it), element-wise
+diffs are straightforward.
+
+### 5.1 Cross-engine contract
+
+For another engine to produce a compatible `layer_<il>.csv`:
+
+- It MUST use the same draw procedure: seed = current local hour, RNG =
+  `std::mt19937_64`, candidate pool of 3000 uniform integers in
+  `[0, n_elements)`, keep first 1000 unique in draw order.
+- It MUST use flattened row-major indices into a tensor of the same
+  `shape` as the corresponding JSON layer object.
+- It MUST emit the header row literally as `index,value` and use a plain
+  comma separator with no quoting.
+- It SHOULD emit values with enough precision to survive an `f16` round
+  trip (≥ 6 significant digits).
+
+Any deviation from the above makes the CSV files non-comparable.
+
+## 6. Versioning
 
 Future non-backwards-compatible changes MUST bump the schema string, e.g.
 `layer-profile/v2`. Backwards-compatible additions (new optional fields) do

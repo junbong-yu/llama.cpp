@@ -28,6 +28,15 @@ struct layer_profile_config {
     bool        dump_full_values = false;
     int         n_sample_values  = 8;
 
+    // Directory for per-layer CSV dumps. When non-empty the profiler
+    // writes `<csv_dir>/layer_<il>.csv` with 1000 randomly sampled
+    // (index,value) pairs for each layer. Sampling uses a seed derived
+    // from the current hour so that multiple runs within the same hour
+    // pick the same indices.
+    std::string csv_dir;
+    int         csv_pool_size    = 3000;
+    int         csv_pick         = 1000;
+
     std::string engine_name      = "llama.cpp";
     std::string engine_version;
     std::string model_id;
@@ -63,6 +72,13 @@ struct layer_profile_entry {
     int64_t total_time_us = 0;
 
     layer_profile_stats output;
+
+    // Random-subsample buffer populated when csv_dir is configured.
+    // `csv_indices` is generated once on the first output capture and
+    // then reused across forward passes; `csv_values` holds the most
+    // recently captured values at those indices.
+    std::vector<int64_t> csv_indices;
+    std::vector<float>   csv_values;
 };
 
 struct layer_profiler {
@@ -79,6 +95,11 @@ struct layer_profiler {
     int64_t total_compute_time_us = 0;
     int64_t n_forward_passes      = 0;
     int64_t n_layer_max           = 0;
+
+    // Seed used for CSV index sampling. Derived once at install time
+    // from the current hour (0..23) so that every layer in the run
+    // shares the same RNG stream.
+    uint64_t csv_seed = 0;
 };
 
 // Install the profiler on `params`. Replaces any pre-existing

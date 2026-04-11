@@ -12,11 +12,16 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <random>
+#include <unordered_set>
 
 using json = nlohmann::ordered_json;
 
@@ -78,12 +83,62 @@ static bool is_layer_output_name(const std::string & base) {
 }
 
 // ---------------------------------------------------------------------------
+// CSV index sampling
+// ---------------------------------------------------------------------------
+
+// Seed derived from the current local hour (0..23). Multiple runs within
+// the same hour will therefore pick the same 1000 tensor positions, which
+// is the behavior explicitly requested by the user.
+static uint64_t current_hour_seed() {
+    const std::time_t now = std::time(nullptr);
+    std::tm local_tm{};
+#ifdef _WIN32
+    localtime_s(&local_tm, &now);
+#else
+    localtime_r(&now, &local_tm);
+#endif
+    return (uint64_t) local_tm.tm_hour;
+}
+
+// Generate `pool_size` random indices in [0, n_elements) using `seed` and
+// return up to `pick` unique indices from that pool, in the order they
+// were drawn. If dedup within the pool yields fewer than `pick` indices,
+// the result is shorter.
+static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
+                                                uint64_t seed,
+                                                int      pool_size,
+                                                int      pick) {
+    if (n_elements <= 0 || pool_size <= 0 || pick <= 0) {
+        return {};
+    }
+
+    std::mt19937_64                        rng(seed);
+    std::uniform_int_distribution<int64_t> dist(0, n_elements - 1);
+
+    std::vector<int64_t>        picked;
+    std::unordered_set<int64_t> seen;
+    picked.reserve((size_t) pick);
+    seen.reserve((size_t) pool_size);
+
+    for (int i = 0; i < pool_size && (int) picked.size() < pick; ++i) {
+        const int64_t idx = dist(rng);
+        if (seen.insert(idx).second) {
+            picked.push_back(idx);
+        }
+    }
+    return picked;
+}
+
+// ---------------------------------------------------------------------------
 // tensor statistics
 // ---------------------------------------------------------------------------
 
-static void compute_stats(const ggml_tensor * t,
-                          layer_profile_stats & s,
-                          const layer_profile_config & cfg) {
+static void capture_layer_output(const ggml_tensor          * t,
+                                 layer_profile_entry        & e,
+                                 const layer_profile_config & cfg,
+                                 uint64_t                     csv_seed) {
+    layer_profile_stats & s = e.output;
+
     s.shape.assign(t->ne, t->ne + GGML_MAX_DIMS);
     s.dtype      = ggml_type_name(t->type);
     s.n_elements = (int64_t) ggml_nelements(t);
@@ -165,6 +220,25 @@ static void compute_stats(const ggml_tensor * t,
             s.full_values[i] = load_f32(i);
         }
     }
+
+    // CSV random subsample: generate the per-layer index list once (on
+    // the first observation of this layer's output) and reuse it across
+    // subsequent forward passes. Values are refreshed every call so the
+    // CSV reflects the last forward pass that was seen.
+    if (!cfg.csv_dir.empty()) {
+        if (e.csv_indices.empty()) {
+            e.csv_indices = make_sample_indices(
+                s.n_elements, csv_seed, cfg.csv_pool_size, cfg.csv_pick);
+        }
+        e.csv_values.clear();
+        e.csv_values.reserve(e.csv_indices.size());
+        for (int64_t idx : e.csv_indices) {
+            if (idx < 0 || idx >= s.n_elements) {
+                continue;
+            }
+            e.csv_values.push_back(load_f32(idx));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +288,7 @@ bool common_layer_profiler_cb_eval(ggml_tensor * t, bool ask, void * user_data) 
             if (e.output_tensor_name.empty()) {
                 e.output_tensor_name = t->name;
             }
-            compute_stats(t, e.output, prof->config);
+            capture_layer_output(t, e, prof->config, prof->csv_seed);
             e.call_count += 1;
             if (il == 0 && base == "l_out") {
                 prof->n_forward_passes += 1;
@@ -255,23 +329,58 @@ static json stats_to_json(const layer_profile_stats & s, bool include_full) {
     return j;
 }
 
+static void write_layer_csv_files(const layer_profiler & prof,
+                                  const std::vector<int> & keys) {
+    const std::string & dir = prof.config.csv_dir;
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        LOG_ERR("%s: failed to create CSV directory '%s': %s\n",
+                __func__, dir.c_str(), ec.message().c_str());
+        return;
+    }
+
+    int written = 0;
+    for (int il : keys) {
+        const auto it = prof.layers.find(il);
+        if (it == prof.layers.end()) {
+            continue;
+        }
+        const auto & e = it->second;
+        if (e.csv_values.empty()) {
+            continue;
+        }
+
+        char fname[64];
+        std::snprintf(fname, sizeof(fname), "layer_%03d.csv", il);
+        const std::filesystem::path path = std::filesystem::path(dir) / fname;
+
+        std::ofstream ofs(path);
+        if (!ofs.is_open()) {
+            LOG_ERR("%s: failed to open '%s' for writing\n",
+                    __func__, path.string().c_str());
+            continue;
+        }
+
+        ofs << "index,value\n";
+        const size_t n = std::min(e.csv_indices.size(), e.csv_values.size());
+        for (size_t i = 0; i < n; ++i) {
+            ofs << e.csv_indices[i] << ',' << e.csv_values[i] << '\n';
+        }
+        ++written;
+    }
+    LOG_INF("%s: wrote %d per-layer CSV file(s) to %s (seed=%llu)\n",
+            __func__, written, dir.c_str(),
+            (unsigned long long) prof.csv_seed);
+}
+
 void common_layer_profiler_flush() {
     if (!g_profiler) {
         return;
     }
 
     std::lock_guard<std::mutex> lock(g_profiler->mtx);
-
-    json root;
-    root["schema"]                = "layer-profile/v1";
-    root["engine"]                = g_profiler->config.engine_name;
-    root["engine_version"]        = g_profiler->config.engine_version;
-    root["model_id"]              = g_profiler->config.model_id;
-    root["device"]                = g_profiler->config.device;
-    root["dtype"]                 = g_profiler->config.dtype;
-    root["n_layer"]               = g_profiler->n_layer_max;
-    root["n_forward_passes"]      = g_profiler->n_forward_passes;
-    root["total_compute_time_us"] = g_profiler->total_compute_time_us;
 
     std::vector<int> keys;
     keys.reserve(g_profiler->layers.size());
@@ -280,32 +389,51 @@ void common_layer_profiler_flush() {
     }
     std::sort(keys.begin(), keys.end());
 
-    json layers_arr = json::array();
-    for (int il : keys) {
-        const auto & e = g_profiler->layers[il];
-        json je;
-        je["layer_index"]        = e.layer_index;
-        je["output_tensor_name"] = e.output_tensor_name;
-        je["tensor_count"]       = e.tensor_count;
-        je["call_count"]         = e.call_count;
-        je["total_time_us"]      = e.total_time_us;
-        je["avg_time_us"]        = e.call_count > 0
-                                       ? (double) e.total_time_us / (double) e.call_count
-                                       : 0.0;
-        je["output"]             = stats_to_json(e.output, g_profiler->config.dump_full_values);
-        layers_arr.push_back(je);
-    }
-    root["layers"] = layers_arr;
+    // --- JSON profile (optional) ---
+    if (!g_profiler->config.output_path.empty()) {
+        json root;
+        root["schema"]                = "layer-profile/v1";
+        root["engine"]                = g_profiler->config.engine_name;
+        root["engine_version"]        = g_profiler->config.engine_version;
+        root["model_id"]              = g_profiler->config.model_id;
+        root["device"]                = g_profiler->config.device;
+        root["dtype"]                 = g_profiler->config.dtype;
+        root["n_layer"]               = g_profiler->n_layer_max;
+        root["n_forward_passes"]      = g_profiler->n_forward_passes;
+        root["total_compute_time_us"] = g_profiler->total_compute_time_us;
 
-    std::ofstream ofs(g_profiler->config.output_path);
-    if (!ofs.is_open()) {
-        LOG_ERR("%s: failed to open '%s' for writing\n",
-                __func__, g_profiler->config.output_path.c_str());
-        return;
+        json layers_arr = json::array();
+        for (int il : keys) {
+            const auto & e = g_profiler->layers[il];
+            json je;
+            je["layer_index"]        = e.layer_index;
+            je["output_tensor_name"] = e.output_tensor_name;
+            je["tensor_count"]       = e.tensor_count;
+            je["call_count"]         = e.call_count;
+            je["total_time_us"]      = e.total_time_us;
+            je["avg_time_us"]        = e.call_count > 0
+                                           ? (double) e.total_time_us / (double) e.call_count
+                                           : 0.0;
+            je["output"]             = stats_to_json(e.output, g_profiler->config.dump_full_values);
+            layers_arr.push_back(je);
+        }
+        root["layers"] = layers_arr;
+
+        std::ofstream ofs(g_profiler->config.output_path);
+        if (!ofs.is_open()) {
+            LOG_ERR("%s: failed to open '%s' for writing\n",
+                    __func__, g_profiler->config.output_path.c_str());
+        } else {
+            ofs << root.dump(2) << std::endl;
+            LOG_INF("%s: wrote layer profile to %s\n",
+                    __func__, g_profiler->config.output_path.c_str());
+        }
     }
-    ofs << root.dump(2) << std::endl;
-    LOG_INF("%s: wrote layer profile to %s\n",
-            __func__, g_profiler->config.output_path.c_str());
+
+    // --- per-layer CSV value dumps (optional) ---
+    if (!g_profiler->config.csv_dir.empty()) {
+        write_layer_csv_files(*g_profiler, keys);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +445,7 @@ static void common_layer_profiler_atexit() {
 }
 
 void common_layer_profiler_install(common_params & params) {
-    if (params.layer_profile_path.empty()) {
+    if (params.layer_profile_path.empty() && params.layer_values_csv_dir.empty()) {
         return;
     }
     if (g_profiler) {
@@ -329,8 +457,10 @@ void common_layer_profiler_install(common_params & params) {
     g_profiler->config.output_path      = params.layer_profile_path;
     g_profiler->config.dump_full_values = params.layer_profile_full;
     g_profiler->config.n_sample_values  = params.layer_profile_samples;
+    g_profiler->config.csv_dir          = params.layer_values_csv_dir;
     g_profiler->config.engine_name      = "llama.cpp";
     g_profiler->config.model_id         = params.model.path;
+    g_profiler->csv_seed                = current_hour_seed();
 
     if (params.cb_eval) {
         LOG_WRN("%s: an existing cb_eval was set on common_params and will be "
@@ -344,9 +474,12 @@ void common_layer_profiler_install(common_params & params) {
         std::atexit(common_layer_profiler_atexit);
     }
 
-    LOG_INF("%s: layer profiler installed, output -> %s (full_values=%d, samples=%d)\n",
+    LOG_INF("%s: layer profiler installed "
+            "(json=%s, csv_dir=%s, full_values=%d, samples=%d, csv_seed=%llu)\n",
             __func__,
-            g_profiler->config.output_path.c_str(),
+            g_profiler->config.output_path.empty() ? "<off>" : g_profiler->config.output_path.c_str(),
+            g_profiler->config.csv_dir.empty()     ? "<off>" : g_profiler->config.csv_dir.c_str(),
             (int) g_profiler->config.dump_full_values,
-            g_profiler->config.n_sample_values);
+            g_profiler->config.n_sample_values,
+            (unsigned long long) g_profiler->csv_seed);
 }

@@ -484,6 +484,7 @@ struct common_params {
     std::string layer_profile_path      = ""; // output JSON path; empty = profiler disabled                // NOLINT
     bool        layer_profile_full      = false; // dump full layer output values (large!)
     int         layer_profile_samples   = 8;     // number of head/tail sample values to record
+    std::string layer_values_csv_dir    = ""; // directory to write per-layer CSV value dumps; empty = off  // NOLINT
 
     std::vector<std::string> in_files;   // all input files
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
