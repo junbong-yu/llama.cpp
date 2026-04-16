@@ -18,6 +18,10 @@
 #    include "kleidiai/kleidiai.h"
 #endif
 
+#ifdef GGML_USE_CPU_CUSTOM_KERNELS
+#    include "custom-kernels/custom-kernels.h"
+#endif
+
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
 #    include "spacemit/ime.h"
 #endif
@@ -64,6 +68,12 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
 #ifdef GGML_USE_CPU_REPACK
         if (ggml_backend_cpu_repack_buffer_type()) {
             bufts.push_back(ggml_backend_cpu_repack_buffer_type());
+        }
+#endif
+
+#ifdef GGML_USE_CPU_CUSTOM_KERNELS
+        if (ggml_backend_cpu_custom_kernels_buffer_type()) {
+            bufts.push_back(ggml_backend_cpu_custom_kernels_buffer_type());
         }
 #endif
 
