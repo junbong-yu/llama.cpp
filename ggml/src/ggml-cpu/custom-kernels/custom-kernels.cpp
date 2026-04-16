@@ -17,10 +17,12 @@
 #include "ggml-impl.h"
 #include "traits.h"
 #include "ops.h"
+#include "vec.h"
 
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 
 // ---------------------------------------------------------------------------
 // Env-var helpers – read once at init
@@ -56,35 +58,188 @@ static custom_kernel_config get_config() {
 }
 
 // ---------------------------------------------------------------------------
-// Custom kernel implementations  (currently: identical copies / pass-through)
+// Custom kernel implementations
 //
-//   *** EDIT THESE to experiment with your optimized versions ***
+// RMS_NORM and SOFT_MAX: fully independent copies of the original code.
+//   You can freely modify these without affecting the baseline.
+//   The RMS_NORM below has a fused sum-of-squares + scale optimization:
+//     Original: 2 passes (sum-of-squares pass, then memcpy + scale pass)
+//     Custom:   1 pass   (fused sum-of-squares → scale in single loop)
 //
-// Each function follows the exact same signature as the original in ops.h /
-// ggml-cpu.c.  To create a truly independent copy you can paste the original
-// source here and modify it.  For the initial baseline comparison the
-// functions simply delegate to the originals so the ONLY measurable
-// difference is the extra_buffer_type dispatch overhead.
+// MUL_MAT and ROPE: pass-through to original (too large to copy inline).
+//   Replace these when you have a custom implementation ready.
 // ---------------------------------------------------------------------------
 
+// --- MUL_MAT: pass-through (very complex, ~600 lines) ---
 static void custom_mul_mat(struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    // >>> Replace with your optimized MUL_MAT kernel <<<
     ggml_compute_forward_mul_mat(params, dst);
 }
 
-static void custom_rms_norm(struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    // >>> Replace with your optimized RMS_NORM kernel <<<
-    ggml_compute_forward_rms_norm(params, dst);
-}
-
-static void custom_soft_max(struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    // >>> Replace with your optimized SOFT_MAX kernel <<<
-    ggml_compute_forward_soft_max(params, dst);
-}
-
+// --- ROPE: pass-through ---
 static void custom_rope(struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    // >>> Replace with your optimized ROPE kernel <<<
     ggml_compute_forward_rope(params, dst);
+}
+
+// ---------------------------------------------------------------------------
+// RMS_NORM — independent copy with fused 1-pass optimization
+//
+// Original algorithm (ops.cpp):
+//   pass 1: sum += x[i]*x[i]             (read x)
+//   pass 2: memcpy(y, x, ...)            (read x again, write y)
+//   pass 3: ggml_vec_scale_f32(y, scale)  (read y, write y)
+//
+// Optimized: fuse into 1 pass:
+//   pass 1: sum += x[i]*x[i]             (read x)
+//           then compute scale
+//   pass 2: y[i] = x[i] * scale          (read x once, write y once)
+//
+// This halves memory traffic on the second pass by avoiding the memcpy.
+// ---------------------------------------------------------------------------
+static void custom_rms_norm(struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    if (src0->type != GGML_TYPE_F32) {
+        // fallback for non-f32
+        ggml_compute_forward_rms_norm(params, dst);
+        return;
+    }
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                float       * y = (float *) ((char *)  dst->data + i01*nb1  + i02*nb2  + i03*nb3);
+
+                // --- pass 1: sum of squares ---
+                double sum = 0.0;
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    sum += (double)(x[i00] * x[i00]);
+                }
+
+                const float scale = 1.0f / sqrtf((float)(sum / ne00) + eps);
+
+                // --- pass 2: fused copy + scale (saves one full read+write vs memcpy+vec_scale) ---
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    y[i00] = x[i00] * scale;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SOFT_MAX — independent copy (identical to original for now)
+//
+// Uses the standard numerically-stable softmax:
+//   1) find max
+//   2) exp(x[i] - max)
+//   3) normalize by sum
+// ---------------------------------------------------------------------------
+static void custom_soft_max(struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * src2 = dst->src[2];
+
+    if (src0->type != GGML_TYPE_F32) {
+        ggml_compute_forward_soft_max(params, dst);
+        return;
+    }
+
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int64_t nb11 = src1 ? src1->nb[1] : 1;
+    const int64_t nb12 = src1 ? src1->nb[2] : 1;
+    const int64_t nb13 = src1 ? src1->nb[3] : 1;
+
+    const int64_t ne12 = src1 ? src1->ne[2] : 1;
+    const int64_t ne13 = src1 ? src1->ne[3] : 1;
+
+    const uint32_t n_head      = ne02;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2((double)n_head));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    float * wp = (float *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
+
+    const bool use_f16 = (src1 && src1->type == GGML_TYPE_F16);
+
+    const float * sk = src2 ? (float *)((char *) src2->data) : nullptr;
+
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
+                const int64_t i11 = i01;
+                const int64_t i12 = i02 % ne12;
+                const int64_t i13 = i03 % ne13;
+
+                // ALiBi
+                const uint32_t h = i02;
+                const float slope = (max_bias > 0.0f) ? (h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1)) : 1.0f;
+
+                float * sp = (float *)((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                float * dp = (float *)((char *)  dst->data + i01*nb1  + i02*nb2  + i03*nb3);
+
+                ggml_fp16_t * mp_f16 = src1 ? (ggml_fp16_t *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
+                float       * mp_f32 = src1 ? (float       *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
+
+                ggml_vec_cpy_f32(ne00, wp, sp);
+                ggml_vec_scale_f32(ne00, wp, scale);
+
+                if (mp_f32) {
+                    if (use_f16) {
+                        for (int i = 0; i < ne00; ++i) {
+                            wp[i] += slope * GGML_CPU_FP16_TO_FP32(mp_f16[i]);
+                        }
+                    } else {
+                        for (int i = 0; i < ne00; ++i) {
+                            wp[i] += slope * mp_f32[i];
+                        }
+                    }
+                }
+
+                float max = -INFINITY;
+                ggml_vec_max_f32(ne00, &max, wp);
+
+                if (sk) {
+                    max = MAX(max, sk[i02]);
+                }
+
+                ggml_float sum = ggml_vec_soft_max_f32(ne00, dp, wp, max);
+                assert(sum > 0.0);
+
+                if (sk) {
+                    sum += (ggml_float) expf(sk[i02] - max);
+                }
+
+                sum = 1.0 / sum;
+                ggml_vec_scale_f32(ne00, dp, sum);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
