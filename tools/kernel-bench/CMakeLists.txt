@@ -32,3 +32,21 @@ target_compile_features(${TARGET2} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET2} RUNTIME)
 endif()
+
+# Backend-level benchmark: registers a sample custom ggml backend and
+# compares it directly against the standard CPU backend
+set(TARGET3 llama-backend-bench)
+add_executable(${TARGET3}
+    backend-bench.cpp
+    custom-backend.cpp
+)
+target_link_libraries(${TARGET3} PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET3} PRIVATE
+    ${CMAKE_SOURCE_DIR}/ggml/include
+    ${CMAKE_SOURCE_DIR}/ggml/src
+)
+target_compile_features(${TARGET3} PRIVATE cxx_std_17)
+
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET3} RUNTIME)
+endif()

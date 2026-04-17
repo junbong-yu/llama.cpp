@@ -1,6 +1,9 @@
 # How to Run Kernel Benchmark Experiments
 
-Guide for running the ggml kernel swap benchmark experiments with `llama-kernel-bench` and `llama-inference-bench`.
+Guide for running the ggml kernel swap benchmark experiments with:
+- `llama-kernel-bench` — isolated op micro-benchmarks
+- `llama-inference-bench` — live kernel swapping during model inference
+- `llama-backend-bench` — backend-level comparison (CPU vs custom ggml backend)
 
 ## 1. Build
 
@@ -11,8 +14,8 @@ cd /Users/junbongyu/src/SR/NNT_LMA/llama.cpp
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 
-# Build both benchmark tools
-cmake --build . --target llama-kernel-bench llama-inference-bench -j$(sysctl -n hw.ncpu)
+# Build all three benchmark tools
+cmake --build . --target llama-kernel-bench llama-inference-bench llama-backend-bench -j$(sysctl -n hw.ncpu)
 ```
 
 Binaries land in `build/bin/`.
@@ -79,7 +82,47 @@ hf_hub_download('Qwen/Qwen3-0.6B-GGUF', 'Qwen3-0.6B-Q8_0.gguf',
 | `-r <n>` | Repetitions | 1 |
 | `-o <file>` | JSON output file | - |
 
-## 4. Experiment workflow (before/after optimization)
+## 4. Backend-level comparison (`llama-backend-bench`)
+
+Registers a sample custom ggml backend (wraps CPU internally) and runs the same
+graph on both the standard CPU backend and the custom backend. Useful as a
+template when adding new backends (CUDA/Hexagon) for apples-to-apples comparison.
+
+```bash
+./build/bin/llama-backend-bench -o /tmp/backend-bench.json
+
+# Filter by op
+./build/bin/llama-backend-bench --op mul_mat -o /tmp/mm.json
+
+# Analyze
+python3 scripts/extract-backend-results.py /tmp/backend-bench.json
+python3 scripts/extract-backend-results.py /tmp/backend-bench.json --op mul_mat
+python3 scripts/extract-backend-results.py /tmp/backend-bench.json --format markdown
+python3 scripts/extract-backend-results.py before.json after.json   # before/after
+```
+
+### CLI options (`llama-backend-bench`)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-o <file>` | JSON output | - |
+| `--op <name>` | Filter by op (add, mul, relu, sigmoid, silu, mul_mat) | all |
+| `--min-time <sec>` | Minimum benchmark time per op | 0.5 |
+| `--warmup <n>` | Warmup iterations | 3 |
+
+### Adding a new backend for comparison
+
+Edit `tools/kernel-bench/backend-bench.cpp`, add to the `backends` vector:
+```cpp
+std::vector<BackendEntry> backends = {
+    {ggml_backend_cpu_init(),               "CPU"},
+    {ggml_backend_custom_init("Custom", 1), "Custom-CPU"},
+    {ggml_backend_cuda_init(0),             "CUDA"},       // if compiled with CUDA
+    {ggml_backend_metal_init(),             "Metal"},      // if compiled with Metal
+};
+```
+
+## 5. Experiment workflow (before/after optimization)
 
 ```bash
 # Step 1: Baseline (before optimization)
