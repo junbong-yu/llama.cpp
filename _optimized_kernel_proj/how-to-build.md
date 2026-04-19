@@ -88,9 +88,11 @@ ggml_backend_reg_t reg = ggml_backend_load("/path/to/libggml-custom-op.so");
 
 ---
 
-## 4. 벤치마크 데모 빌드
+## 4. 벤치마크 빌드
 
-`examples/custom-op/benchmark-custom-op.cpp`는 커스텀 백엔드와 CPU 백엔드의 성능을 비교하는 데모 프로그램이다.
+### 4.1 커스텀 Op 벤치마크 (GGML 그래프 단위)
+
+`examples/custom-op/benchmark-custom-op.cpp`는 커스텀 백엔드와 CPU 백엔드의 MUL_MAT 성능을 비교하는 데모다.
 
 ```bash
 cmake -B build -DGGML_CUSTOM_OP=ON -DCMAKE_BUILD_TYPE=Release
@@ -104,6 +106,21 @@ cmake --build build --target benchmark-custom-op -j$(nproc)
 
 # 사용자 지정: M=1024, N=1024, K=1024, 20회 반복
 ./build/bin/benchmark-custom-op 1024 1024 1024 20
+```
+
+### 4.2 레이어별 연산시간 벤치마크 (실제 모델)
+
+`examples/custom-op/benchmark-layer-timing.cpp`는 실제 모델을 로드하여 레이어별/Op별 연산 시간을 측정한다.
+
+```bash
+cmake -B build -DGGML_CUSTOM_OP=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target benchmark-layer-timing -j$(nproc)
+```
+
+실행:
+```bash
+./build/bin/benchmark-layer-timing -m models/llama-2-7b.Q4_K_M.gguf -p "Hello world" -n 32
+./build/bin/benchmark-layer-timing -m models/qwen2-1.5b.Q4_K_M.gguf --warmup 1 --repeat 3
 ```
 
 ---
@@ -211,7 +228,9 @@ llama.cpp/
 │       └── CMakeLists.txt             # ggml_add_backend(CUSTOM_OP) 추가됨
 ├── examples/
 │   └── custom-op/
-│       └── benchmark-custom-op.cpp    # 벤치마크 데모
+│       ├── CMakeLists.txt             # 빌드 타겟 (benchmark-custom-op, benchmark-layer-timing)
+│       ├── benchmark-custom-op.cpp    # GGML 그래프 단위 벤치마크
+│       └── benchmark-layer-timing.cpp # 레이어별 연산시간 벤치마크
 └── _optimized_kernel_proj/
     ├── how-to-build.md               # 이 파일
     └── how-to-test.md                 # 테스트 가이드
