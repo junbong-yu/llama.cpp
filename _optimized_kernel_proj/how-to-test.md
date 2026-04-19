@@ -473,3 +473,98 @@ ggml_backend_custom_op_register_kernel(
 4. **다중 백엔드 인스턴스**: 현재 글로벌 컨텍스트 포인터(`g_custom_op_ctx`)를 사용하므로, 백엔드 인스턴스는 하나만 생성해야 한다. 여러 인스턴스를 생성하면 마지막 인스턴스의 컨텍스트만 사용된다.
 
 5. **동적 로딩 시 시드**: `ggml_backend_load_all()`을 호출하기 전에 `register_kernel()`을 호출하면, 커널이 보류 목록에 저장되고 백엔드 초기화 시 컨텍스트로 이동한다. 초기화 후에 `register_kernel()`을 호출하면 직접 컨텍스트에 추가된다.
+
+---
+
+## 9. 레이어별 연산시간 벤치마크
+
+`benchmark-layer-timing`은 실제 모델을 실행하면서 각 레이어의 Op별 연산 시간을 측정하는 도구다. `ggml_backend_sched_eval_callback`을 사용하여 그래프의 모든 노드에 대해 전후 `ggml_backend_synchronize()`를 호출하고 마이크로초 단위로 타이밍을 수집한다.
+
+### 9.1 빌드
+
+```bash
+cmake -B build -DGGML_CUSTOM_OP=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target benchmark-layer-timing -j$(nproc)
+```
+
+### 9.2 실행
+
+```bash
+# 기본: 모델 로드 후 프롬프트/토큰 생성 타이밍 측정
+./build/bin/benchmark-layer-timing -m models/llama-2-7b.Q4_K_M.gguf -p "Hello world"
+
+# 웜업 2회, 반복 3회 측정
+./build/bin/benchmark-layer-timing -m models/llama-2-7b.Q4_K_M.gguf -p "Hello world" --warmup 2 --repeat 3
+
+# 생성 토큰 수 지정
+./build/bin/benchmark-layer-timing -m models/llama-2-7b.Q4_K_M.gguf -p "Hello world" -n 64
+```
+
+### 9.3 출력 형식
+
+```
+=== Layer Timing Benchmark ===
+Model: models/llama-2-7b.Q4_K_M.gguf
+Warmup: 1, Repeat: 1
+n_gpu_layers: 99
+
+Model info:
+  n_ctx_train: 4096
+  n_layer:     32
+  n_embd:      4096
+  n_vocab:     32000
+
+Custom-Op backend: detected (device: Custom-Op)   # 또는 "not loaded"
+
+Active backends:
+  [0] CPU (CPU)
+  [1] Custom-Op (Accelerator)
+
+=== Per-Layer Timing (Prompt Eval Run 1) ===
+Prompt tokens: 4
+
+Layer       Time (ms)  Op breakdown
+-----       ---------  ------------------
+    0      2.341 ms  ( 5.1%)  attn_norm: 0.12ms, attn_q: 0.89ms, attn_k: 0.31ms, attn_v: 0.28ms
+    1      2.278 ms  ( 4.9%)  attn_norm: 0.11ms, attn_q: 0.87ms, attn_k: 0.30ms, attn_v: 0.27ms
+  ...
+   31      2.412 ms  ( 5.2%)  attn_norm: 0.13ms, attn_q: 0.91ms, attn_k: 0.32ms, attn_v: 0.29ms
+
+--- Summary ---
+Total layer compute: 78.234 ms
+Avg per layer:       2.445 ms
+Slowest layer:       3 (3.12 ms)
+Fastest layer:       15 (1.98 ms)
+
+--- Global Op Distribution ---
+Op                     Time (ms)    Count % of Total
+--                     --------    ----- ---------
+MUL_MAT                 48.123        96    61.5%
+RMS_NORM                 4.234        64     5.4%
+SILU                     2.891        32     3.7%
+...
+
+=== Per-Layer Timing (Token Gen Run 1) ===
+Generated tokens: 32
+...
+```
+
+### 9.4 작동 원리
+
+1. **`llama_context_params.cb_eval`** 설정: `ggml_backend_sched_eval_callback`을 통해 스케줄러가 모든 그래프 노드에 대해 콜백을 호출
+2. **노드 이름 파싱**: 각 노드의 이름(예: `"attn_q-7"`)에서 레이어 인덱스(`7`)와 Op 이름(`"attn_q"`)을 추출
+3. **시간 누적**: `ask=true` (관찰 여부 질문) → 항상 `true` 반환, `ask=false` (계산 완료 통지) → 이전 노드 이후 경과 시간을 누적
+4. **백엔드 동기화**: 콜백이 설정되면 스케줄러가 각 노드 계산 후 `ggml_backend_synchronize()`를 호출하므로 정확한 타이밍 보장
+
+### 9.5 커스텀 백엔드와의 연동
+
+Custom-Op 백엔드가 MUL_MAT 커널을 등록하면, 스케줄러가 해당 Op를 Custom-Op 백엔드에 할당한다. 레이어 타이밍 출력에서 MUL_MAT Op의 시간이 Custom-Op 백엔드에서 처리된 것임을 확인할 수 있다.
+
+현재 구현에서는 백엔드별 시간 구분이 출력에 포함되지 않지만, `eval_callback`에서 `ggml_backend_get_name()`을 호출하여 노드가 어느 백엔드에서 처리되었는지 확인할 수 있다 (스케줄러의 노드-백엔드 매핑 필요).
+
+### 9.6 활용 시나리오
+
+1. **병목 레이어 식별**: 어떤 레이어의 어떤 Op가 전체 추론 시간의 대부분을 차지하는지 파악
+2. **커스텀 커널 효과 측정**: MUL_MAT 커널을 교체하기 전후로 레이어 타이밍을 비교
+3. **백엔드 오프로딩 튜닝**: `n_gpu_layers` 값을 조정하면서 CPU/GPU 분산 효과 분석
+4. **양자화 영향 분석**: Q4_K_M vs Q8_0 등 양자화 포맷별 레이어 성능 비교

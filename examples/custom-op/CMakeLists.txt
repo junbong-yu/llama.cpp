@@ -1,0 +1,21 @@
+set(TARGET benchmark-custom-op)
+add_executable(${TARGET} benchmark-custom-op.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if (GGML_CUSTOM_OP)
+    target_compile_definitions(${TARGET} PRIVATE GGML_USE_CUSTOM_OP)
+    target_link_libraries(${TARGET} PRIVATE ggml-custom-op)
+endif()
+
+set(TARGET benchmark-layer-timing)
+add_executable(${TARGET} benchmark-layer-timing.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if (GGML_CUSTOM_OP)
+    target_compile_definitions(${TARGET} PRIVATE GGML_USE_CUSTOM_OP)
+    target_link_libraries(${TARGET} PRIVATE ggml-custom-op)
+endif()
