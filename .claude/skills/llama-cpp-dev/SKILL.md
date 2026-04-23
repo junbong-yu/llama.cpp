@@ -61,7 +61,7 @@ Agent(
     {사용자 요청 상세}
 
     [프로젝트 루트]
-    /Users/junbongyu/src/SR/NNT_LMA/llama.cpp
+    /Users/junbongyu/src/sr/llama.cpp
 
     [이전 산출물] (있는 경우)
     {_workspace/ 내 관련 파일 경로}
