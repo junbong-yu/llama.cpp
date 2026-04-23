@@ -17,6 +17,8 @@
 // Running the produced object on Apple Silicon (no SVE hardware) raises
 // SIGILL — this file only proves the compile path, not execution.
 
+#include "kernels-sve.h"
+
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
 #include <stddef.h>

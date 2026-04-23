@@ -50,3 +50,19 @@ target_compile_features(${TARGET3} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET3} RUNTIME)
 endif()
+
+# Optional SVE plug-point source. Enabled only if the compiler accepts
+# -march=armv8-a+sve. The TU itself has an __ARM_FEATURE_SVE guard so
+# dropping the flag silently falls back to an empty namespace -- this
+# block only controls whether the file is added to the build graph and
+# whether the SVE march flag reaches its compile line.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-march=armv8-a+sve" KB_HAVE_SVE_COMPILER)
+if (KB_HAVE_SVE_COMPILER)
+    target_sources(${TARGET}  PRIVATE kernels/kernels-sve.cpp)
+    target_sources(${TARGET2} PRIVATE kernels/kernels-sve.cpp)
+    set_source_files_properties(kernels/kernels-sve.cpp
+        PROPERTIES COMPILE_OPTIONS "-march=armv8-a+sve")
+    target_compile_definitions(${TARGET}  PRIVATE KB_HAVE_SVE=1)
+    target_compile_definitions(${TARGET2} PRIVATE KB_HAVE_SVE=1)
+endif()
