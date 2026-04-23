@@ -69,6 +69,8 @@ add_library(${TARGET} STATIC
     json-partial.cpp
     json-partial.h
     json-schema-to-grammar.cpp
+    layer-profile.cpp
+    layer-profile.h
     llguidance.cpp
     log.cpp
     log.h

@@ -3709,6 +3709,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tensor_filter.push_back(value);
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--layer-profile"}, "FNAME",
+        "write per-layer timing and output statistics to FNAME as JSON "
+        "(schema: layer-profile/v1, see docs/layer-profile-schema.md)",
+        [](common_params & params, const std::string & value) {
+            params.layer_profile_path = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--layer-profile-full"},
+        "also record full per-layer output values in the layer profile JSON "
+        "(warning: large output)",
+        [](common_params & params) {
+            params.layer_profile_full = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--layer-profile-samples"}, "N",
+        string_format("number of head/tail sample values to record per layer output "
+                      "in the layer profile JSON (default: %d)", params.layer_profile_samples),
+        [](common_params & params, int value) {
+            params.layer_profile_samples = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--layer-values-csv"}, "DIR",
+        "write one CSV file per layer (layer_<il>.csv) with up to 300 "
+        "randomly sampled output values to DIR; sampling uses a seed "
+        "derived from the current hour and draws unique indices. If a "
+        "layer output has fewer than 300 elements, all values are dumped.",
+        [](common_params & params, const std::string & value) {
+            params.layer_values_csv_dir = value;
+        }
+    ));
 
     // presets
     add_opt(common_arg(

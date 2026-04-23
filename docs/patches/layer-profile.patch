@@ -1,0 +1,1347 @@
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index b313a73..5b22f47 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -69,6 +69,8 @@ add_library(${TARGET} STATIC
+     json-partial.cpp
+     json-partial.h
+     json-schema-to-grammar.cpp
++    layer-profile.cpp
++    layer-profile.h
+     llguidance.cpp
+     log.cpp
+     log.h
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 3d0183e..ff4e2df 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3709,6 +3709,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.tensor_filter.push_back(value);
+         }
+     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
++    add_opt(common_arg(
++        {"--layer-profile"}, "FNAME",
++        "write per-layer timing and output statistics to FNAME as JSON "
++        "(schema: layer-profile/v1, see docs/layer-profile-schema.md)",
++        [](common_params & params, const std::string & value) {
++            params.layer_profile_path = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--layer-profile-full"},
++        "also record full per-layer output values in the layer profile JSON "
++        "(warning: large output)",
++        [](common_params & params) {
++            params.layer_profile_full = true;
++        }
++    ));
++    add_opt(common_arg(
++        {"--layer-profile-samples"}, "N",
++        string_format("number of head/tail sample values to record per layer output "
++                      "in the layer profile JSON (default: %d)", params.layer_profile_samples),
++        [](common_params & params, int value) {
++            params.layer_profile_samples = value;
++        }
++    ));
++    add_opt(common_arg(
++        {"--layer-values-csv"}, "DIR",
++        "write one CSV file per layer (layer_<il>.csv) with up to 300 "
++        "randomly sampled output values to DIR; sampling uses a seed "
++        "derived from the current hour and draws unique indices. If a "
++        "layer output has fewer than 300 elements, all values are dumped.",
++        [](common_params & params, const std::string & value) {
++            params.layer_values_csv_dir = value;
++        }
++    ));
+ 
+     // presets
+     add_opt(common_arg(
+diff --git a/common/common.cpp b/common/common.cpp
+index 16f78de..f5c30a7 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2,6 +2,7 @@
+ #include "gguf.h"
+ 
+ #include "common.h"
++#include "layer-profile.h"
+ #include "log.h"
+ #include "llama.h"
+ #include "sampling.h"
+@@ -1265,6 +1266,10 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+ }
+ 
+ common_init_result_ptr common_init_from_params(common_params & params) {
++    // Must run before the llama_context is created so that cb_eval is
++    // propagated through llama_context_params_from_params -> cparams.
++    common_layer_profiler_install(params);
++
+     common_init_result_ptr res(new common_init_result(params));
+ 
+     llama_model * model = res->model();
+diff --git a/common/common.h b/common/common.h
+index 020b6a7..db35092 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -480,6 +480,12 @@ struct common_params {
+     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
+     std::vector<std::string> tensor_filter; // filter tensor names for debug output (regex)                 // NOLINT
+ 
++    // layer profiler (see common/layer-profile.h and docs/layer-profile-schema.md)
++    std::string layer_profile_path      = ""; // output JSON path; empty = profiler disabled                // NOLINT
++    bool        layer_profile_full      = false; // dump full layer output values (large!)
++    int         layer_profile_samples   = 8;     // number of head/tail sample values to record
++    std::string layer_values_csv_dir    = ""; // directory to write per-layer CSV value dumps; empty = off  // NOLINT
++
+     std::vector<std::string> in_files;   // all input files
+     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
+     std::vector<llama_model_kv_override> kv_overrides;
+diff --git a/common/layer-profile.cpp b/common/layer-profile.cpp
+new file mode 100644
+index 0000000..dbcb728
+--- /dev/null
++++ b/common/layer-profile.cpp
+@@ -0,0 +1,499 @@
++#include "layer-profile.h"
++
++#include "common.h"
++#include "log.h"
++
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#define JSON_ASSERT GGML_ASSERT
++#include <nlohmann/json.hpp>
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <filesystem>
++#include <fstream>
++#include <limits>
++#include <memory>
++#include <random>
++#include <unordered_set>
++
++using json = nlohmann::ordered_json;
++
++// ---------------------------------------------------------------------------
++// global state
++// ---------------------------------------------------------------------------
++
++static std::unique_ptr<layer_profiler> g_profiler;
++static std::atomic<bool>               g_atexit_registered{false};
++
++// ---------------------------------------------------------------------------
++// name parsing helpers
++// ---------------------------------------------------------------------------
++
++// llama.cpp tags layer-bound tensors as "<base>-<layer_index>" (see
++// llama_context::graph_get_cb in src/llama-context.cpp). We reuse that
++// suffix to recover the layer each node belongs to.
++static int parse_layer_index(const char * name) {
++    if (!name || !*name) {
++        return -1;
++    }
++    const char * dash = std::strrchr(name, '-');
++    if (!dash || !*(dash + 1)) {
++        return -1;
++    }
++    int         il  = 0;
++    bool        any = false;
++    for (const char * p = dash + 1; *p; ++p) {
++        if (*p < '0' || *p > '9') {
++            return -1;
++        }
++        il  = il * 10 + (*p - '0');
++        any = true;
++    }
++    return any ? il : -1;
++}
++
++static std::string extract_base_name(const char * name) {
++    if (!name) {
++        return {};
++    }
++    const char * dash = std::strrchr(name, '-');
++    if (!dash) {
++        return name;
++    }
++    for (const char * p = dash + 1; *p; ++p) {
++        if (*p < '0' || *p > '9') {
++            return name;
++        }
++    }
++    return std::string(name, dash - name);
++}
++
++// Tensor name used by llama.cpp model builders as the final per-layer
++// residual output. The canonical choice is `l_out`; `ffn_out` is a
++// reasonable fallback for the few builders that don't emit `l_out`.
++static bool is_layer_output_name(const std::string & base) {
++    return base == "l_out" || base == "ffn_out";
++}
++
++// ---------------------------------------------------------------------------
++// CSV index sampling
++// ---------------------------------------------------------------------------
++
++// Seed derived from the current local hour (0..23). Multiple runs within
++// the same hour will therefore pick the same 1000 tensor positions, which
++// is the behavior explicitly requested by the user.
++static uint64_t current_hour_seed() {
++    const std::time_t now = std::time(nullptr);
++    std::tm local_tm{};
++#ifdef _WIN32
++    localtime_s(&local_tm, &now);
++#else
++    localtime_r(&now, &local_tm);
++#endif
++    return (uint64_t) local_tm.tm_hour;
++}
++
++// Build the list of tensor positions that will be dumped to CSV for a
++// given layer. The returned vector is sorted in ascending order so
++// that the resulting CSV is easy to diff line-by-line.
++//
++//   - If the tensor has <= n_samples elements, every position is kept
++//     in natural order (no randomness is needed or useful).
++//   - Otherwise, draw n_samples *unique* indices uniformly from
++//     [0, n_elements) with rejection sampling and then sort them.
++static std::vector<int64_t> make_sample_indices(int64_t  n_elements,
++                                                uint64_t seed,
++                                                int      n_samples) {
++    if (n_elements <= 0 || n_samples <= 0) {
++        return {};
++    }
++
++    if (n_elements <= (int64_t) n_samples) {
++        std::vector<int64_t> all;
++        all.reserve((size_t) n_elements);
++        for (int64_t i = 0; i < n_elements; ++i) {
++            all.push_back(i);
++        }
++        return all;
++    }
++
++    std::mt19937_64                        rng(seed);
++    std::uniform_int_distribution<int64_t> dist(0, n_elements - 1);
++
++    std::vector<int64_t>        picked;
++    std::unordered_set<int64_t> seen;
++    picked.reserve((size_t) n_samples);
++    seen.reserve((size_t) n_samples);
++
++    while ((int) picked.size() < n_samples) {
++        const int64_t idx = dist(rng);
++        if (seen.insert(idx).second) {
++            picked.push_back(idx);
++        }
++    }
++
++    std::sort(picked.begin(), picked.end());
++    return picked;
++}
++
++// ---------------------------------------------------------------------------
++// tensor statistics
++// ---------------------------------------------------------------------------
++
++static void capture_layer_output(const ggml_tensor          * t,
++                                 layer_profile_entry        & e,
++                                 const layer_profile_config & cfg,
++                                 uint64_t                     csv_seed) {
++    layer_profile_stats & s = e.output;
++
++    s.shape.assign(t->ne, t->ne + GGML_MAX_DIMS);
++    s.dtype      = ggml_type_name(t->type);
++    s.n_elements = (int64_t) ggml_nelements(t);
++
++    // For now we only compute value statistics for the float types the
++    // debug tooling already supports. Quantized tensors are recorded with
++    // shape/dtype only.
++    if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
++        return;
++    }
++
++    const size_t n_bytes = ggml_nbytes(t);
++    std::vector<uint8_t> staging;
++    const uint8_t * data_ptr = nullptr;
++
++    const bool is_host = ggml_backend_buffer_is_host(t->buffer);
++    if (is_host) {
++        data_ptr = (const uint8_t *) t->data;
++    } else {
++        staging.resize(n_bytes);
++        ggml_backend_tensor_get(t, staging.data(), 0, n_bytes);
++        data_ptr = staging.data();
++    }
++
++    auto load_f32 = [&](int64_t idx) -> float {
++        if (t->type == GGML_TYPE_F32) {
++            return ((const float *) data_ptr)[idx];
++        }
++        if (t->type == GGML_TYPE_F16) {
++            return ggml_fp16_to_fp32(((const ggml_fp16_t *) data_ptr)[idx]);
++        }
++        return ggml_bf16_to_fp32(((const ggml_bf16_t *) data_ptr)[idx]);
++    };
++
++    const int64_t n = s.n_elements;
++
++    double   sum_v = 0.0;
++    double   sum_sq = 0.0;
++    float    mn  =  std::numeric_limits<float>::infinity();
++    float    mx  = -std::numeric_limits<float>::infinity();
++    int64_t  nans = 0;
++    int64_t  infs = 0;
++    int64_t  valid = 0;
++
++    for (int64_t i = 0; i < n; ++i) {
++        const float v = load_f32(i);
++        if (std::isnan(v)) { ++nans; continue; }
++        if (std::isinf(v)) { ++infs; continue; }
++        sum_v  += v;
++        sum_sq += (double) v * (double) v;
++        if (v < mn) mn = v;
++        if (v > mx) mx = v;
++        ++valid;
++    }
++
++    s.min       = valid > 0 ? mn : 0.0f;
++    s.max       = valid > 0 ? mx : 0.0f;
++    s.sum       = sum_v;
++    s.mean      = valid > 0 ? sum_v / (double) valid : 0.0;
++    const double var = valid > 0 ? (sum_sq / (double) valid) - (s.mean * s.mean) : 0.0;
++    s.std_dev   = var > 0.0 ? std::sqrt(var) : 0.0;
++    s.l2_norm   = std::sqrt(sum_sq);
++    s.nan_count = nans;
++    s.inf_count = infs;
++
++    const int n_sample = std::min<int>(cfg.n_sample_values, (int) n);
++    s.sample_head.resize(n_sample);
++    for (int i = 0; i < n_sample; ++i) {
++        s.sample_head[i] = load_f32(i);
++    }
++    s.sample_tail.resize(n_sample);
++    for (int i = 0; i < n_sample; ++i) {
++        s.sample_tail[i] = load_f32(n - n_sample + i);
++    }
++
++    if (cfg.dump_full_values) {
++        s.full_values.resize(n);
++        for (int64_t i = 0; i < n; ++i) {
++            s.full_values[i] = load_f32(i);
++        }
++    }
++
++    // CSV random subsample: generate the per-layer index list once (on
++    // the first observation of this layer's output) and reuse it across
++    // subsequent forward passes. Values are refreshed every call so the
++    // CSV reflects the last forward pass that was seen.
++    if (!cfg.csv_dir.empty()) {
++        if (e.csv_indices.empty()) {
++            e.csv_indices = make_sample_indices(
++                s.n_elements, csv_seed, cfg.csv_n_samples);
++        }
++        e.csv_values.clear();
++        e.csv_values.reserve(e.csv_indices.size());
++        for (int64_t idx : e.csv_indices) {
++            if (idx < 0 || idx >= s.n_elements) {
++                continue;
++            }
++            e.csv_values.push_back(load_f32(idx));
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// eval callback
++// ---------------------------------------------------------------------------
++
++bool common_layer_profiler_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
++    auto * prof = (layer_profiler *) user_data;
++    if (!prof) {
++        return true;
++    }
++
++    // The scheduler invokes the callback twice per node: once with ask=true
++    // to request the data, and once with ask=false after the node has been
++    // computed and copied to host if necessary. We do our accounting on the
++    // ask=false pass so that `ggml_backend_tensor_get` is safe to call.
++    if (ask) {
++        return true;
++    }
++
++    const int64_t now = ggml_time_us();
++
++    std::lock_guard<std::mutex> lock(prof->mtx);
++
++    // Attribute the time delta to the PREVIOUS node. When we see the
++    // ask=false pass for node N, node N-1 has just finished executing, so
++    // dt = now - prev_time_us is a close approximation of N-1's wall time.
++    if (prof->prev_tensor_time_us != 0) {
++        const int64_t dt = now - prof->prev_tensor_time_us;
++        if (dt > 0) {
++            prof->total_compute_time_us += dt;
++            if (prof->prev_tensor_layer >= 0) {
++                auto & e = prof->layers[prof->prev_tensor_layer];
++                e.layer_index    = prof->prev_tensor_layer;
++                e.total_time_us += dt;
++                e.tensor_count  += 1;
++            }
++        }
++    }
++
++    const int il = parse_layer_index(t->name);
++    if (il >= 0) {
++        const std::string base = extract_base_name(t->name);
++        if (is_layer_output_name(base)) {
++            auto & e = prof->layers[il];
++            e.layer_index = il;
++            if (e.output_tensor_name.empty()) {
++                e.output_tensor_name = t->name;
++            }
++            capture_layer_output(t, e, prof->config, prof->csv_seed);
++            e.call_count += 1;
++            if (il == 0 && base == "l_out") {
++                prof->n_forward_passes += 1;
++            }
++        }
++        if (il + 1 > prof->n_layer_max) {
++            prof->n_layer_max = il + 1;
++        }
++    }
++
++    prof->prev_tensor_layer   = il;
++    prof->prev_tensor_time_us = now;
++    return true;
++}
++
++// ---------------------------------------------------------------------------
++// serialization
++// ---------------------------------------------------------------------------
++
++static json stats_to_json(const layer_profile_stats & s, bool include_full) {
++    json j;
++    j["shape"]       = s.shape;
++    j["dtype"]       = s.dtype;
++    j["n_elements"]  = s.n_elements;
++    j["min"]         = s.min;
++    j["max"]         = s.max;
++    j["sum"]         = s.sum;
++    j["mean"]        = s.mean;
++    j["std"]         = s.std_dev;
++    j["l2_norm"]     = s.l2_norm;
++    j["nan_count"]   = s.nan_count;
++    j["inf_count"]   = s.inf_count;
++    j["sample_head"] = s.sample_head;
++    j["sample_tail"] = s.sample_tail;
++    if (include_full) {
++        j["values"] = s.full_values;
++    }
++    return j;
++}
++
++static void write_layer_csv_files(const layer_profiler & prof,
++                                  const std::vector<int> & keys) {
++    const std::string & dir = prof.config.csv_dir;
++
++    std::error_code ec;
++    std::filesystem::create_directories(dir, ec);
++    if (ec) {
++        LOG_ERR("%s: failed to create CSV directory '%s': %s\n",
++                __func__, dir.c_str(), ec.message().c_str());
++        return;
++    }
++
++    int written = 0;
++    for (int il : keys) {
++        const auto it = prof.layers.find(il);
++        if (it == prof.layers.end()) {
++            continue;
++        }
++        const auto & e = it->second;
++        if (e.csv_values.empty()) {
++            continue;
++        }
++
++        char fname[64];
++        std::snprintf(fname, sizeof(fname), "layer_%03d.csv", il);
++        const std::filesystem::path path = std::filesystem::path(dir) / fname;
++
++        std::ofstream ofs(path);
++        if (!ofs.is_open()) {
++            LOG_ERR("%s: failed to open '%s' for writing\n",
++                    __func__, path.string().c_str());
++            continue;
++        }
++
++        ofs << "index,value\n";
++        const size_t n = std::min(e.csv_indices.size(), e.csv_values.size());
++        for (size_t i = 0; i < n; ++i) {
++            ofs << e.csv_indices[i] << ',' << e.csv_values[i] << '\n';
++        }
++        ++written;
++    }
++    LOG_INF("%s: wrote %d per-layer CSV file(s) to %s (seed=%llu)\n",
++            __func__, written, dir.c_str(),
++            (unsigned long long) prof.csv_seed);
++}
++
++void common_layer_profiler_flush() {
++    if (!g_profiler) {
++        return;
++    }
++
++    std::lock_guard<std::mutex> lock(g_profiler->mtx);
++
++    std::vector<int> keys;
++    keys.reserve(g_profiler->layers.size());
++    for (auto & kv : g_profiler->layers) {
++        keys.push_back(kv.first);
++    }
++    std::sort(keys.begin(), keys.end());
++
++    // --- JSON profile (optional) ---
++    if (!g_profiler->config.output_path.empty()) {
++        json root;
++        root["schema"]                = "layer-profile/v1";
++        root["engine"]                = g_profiler->config.engine_name;
++        root["engine_version"]        = g_profiler->config.engine_version;
++        root["model_id"]              = g_profiler->config.model_id;
++        root["device"]                = g_profiler->config.device;
++        root["dtype"]                 = g_profiler->config.dtype;
++        root["n_layer"]               = g_profiler->n_layer_max;
++        root["n_forward_passes"]      = g_profiler->n_forward_passes;
++        root["total_compute_time_us"] = g_profiler->total_compute_time_us;
++
++        json layers_arr = json::array();
++        for (int il : keys) {
++            const auto & e = g_profiler->layers[il];
++            json je;
++            je["layer_index"]        = e.layer_index;
++            je["output_tensor_name"] = e.output_tensor_name;
++            je["tensor_count"]       = e.tensor_count;
++            je["call_count"]         = e.call_count;
++            je["total_time_us"]      = e.total_time_us;
++            je["avg_time_us"]        = e.call_count > 0
++                                           ? (double) e.total_time_us / (double) e.call_count
++                                           : 0.0;
++            je["output"]             = stats_to_json(e.output, g_profiler->config.dump_full_values);
++            layers_arr.push_back(je);
++        }
++        root["layers"] = layers_arr;
++
++        std::ofstream ofs(g_profiler->config.output_path);
++        if (!ofs.is_open()) {
++            LOG_ERR("%s: failed to open '%s' for writing\n",
++                    __func__, g_profiler->config.output_path.c_str());
++        } else {
++            ofs << root.dump(2) << std::endl;
++            LOG_INF("%s: wrote layer profile to %s\n",
++                    __func__, g_profiler->config.output_path.c_str());
++        }
++    }
++
++    // --- per-layer CSV value dumps (optional) ---
++    if (!g_profiler->config.csv_dir.empty()) {
++        write_layer_csv_files(*g_profiler, keys);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// installation
++// ---------------------------------------------------------------------------
++
++static void common_layer_profiler_atexit() {
++    common_layer_profiler_flush();
++}
++
++void common_layer_profiler_install(common_params & params) {
++    if (params.layer_profile_path.empty() && params.layer_values_csv_dir.empty()) {
++        return;
++    }
++    if (g_profiler) {
++        LOG_WRN("%s: layer profiler already installed, skipping\n", __func__);
++        return;
++    }
++
++    g_profiler = std::make_unique<layer_profiler>();
++    g_profiler->config.output_path      = params.layer_profile_path;
++    g_profiler->config.dump_full_values = params.layer_profile_full;
++    g_profiler->config.n_sample_values  = params.layer_profile_samples;
++    g_profiler->config.csv_dir          = params.layer_values_csv_dir;
++    g_profiler->config.engine_name      = "llama.cpp";
++    g_profiler->config.model_id         = params.model.path;
++    g_profiler->csv_seed                = current_hour_seed();
++
++    if (params.cb_eval) {
++        LOG_WRN("%s: an existing cb_eval was set on common_params and will be "
++                "replaced by the layer profiler callback\n", __func__);
++    }
++    params.cb_eval           = common_layer_profiler_cb_eval;
++    params.cb_eval_user_data = g_profiler.get();
++
++    bool expected = false;
++    if (g_atexit_registered.compare_exchange_strong(expected, true)) {
++        std::atexit(common_layer_profiler_atexit);
++    }
++
++    LOG_INF("%s: layer profiler installed "
++            "(json=%s, csv_dir=%s, full_values=%d, samples=%d, csv_seed=%llu)\n",
++            __func__,
++            g_profiler->config.output_path.empty() ? "<off>" : g_profiler->config.output_path.c_str(),
++            g_profiler->config.csv_dir.empty()     ? "<off>" : g_profiler->config.csv_dir.c_str(),
++            (int) g_profiler->config.dump_full_values,
++            g_profiler->config.n_sample_values,
++            (unsigned long long) g_profiler->csv_seed);
++}
+diff --git a/common/layer-profile.h b/common/layer-profile.h
+new file mode 100644
+index 0000000..6a57254
+--- /dev/null
++++ b/common/layer-profile.h
+@@ -0,0 +1,115 @@
++#pragma once
++
++// Per-layer inference profiler for llama.cpp.
++//
++// Installs a ggml_backend_sched_eval_callback that:
++//   1. Measures wall-clock time taken by each graph node and attributes the
++//      time to the transformer layer the node belongs to (layer index is
++//      parsed from the tensor name suffix, e.g. "l_out-13" -> layer 13).
++//   2. Captures per-layer output tensor statistics (shape, dtype, min, max,
++//      mean, std, L2-norm, NaN/Inf counts, head/tail sample values and,
++//      optionally, the full value array).
++//
++// Results are written to a JSON file at program exit in the unified
++// "layer-profile/v1" schema that is shared across inference engines. See
++// docs/layer-profile-schema.md for the full specification.
++
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++struct ggml_tensor;
++struct common_params;
++
++struct layer_profile_config {
++    std::string output_path;
++    bool        dump_full_values = false;
++    int         n_sample_values  = 8;
++
++    // Directory for per-layer CSV dumps. When non-empty the profiler
++    // writes `<csv_dir>/layer_<il>.csv` with `csv_n_samples` randomly
++    // sampled (index,value) pairs for each layer. Sampling uses a seed
++    // derived from the current hour so that multiple runs within the
++    // same hour pick the same indices.
++    std::string csv_dir;
++    int         csv_n_samples    = 300;
++
++    std::string engine_name      = "llama.cpp";
++    std::string engine_version;
++    std::string model_id;
++    std::string device;
++    std::string dtype;
++};
++
++struct layer_profile_stats {
++    std::vector<int64_t> shape;     // ne[0..3]
++    std::string          dtype;
++    int64_t              n_elements = 0;
++
++    float    min     = 0.0f;
++    float    max     = 0.0f;
++    double   sum     = 0.0;
++    double   mean    = 0.0;
++    double   std_dev = 0.0;
++    double   l2_norm = 0.0;
++    int64_t  nan_count = 0;
++    int64_t  inf_count = 0;
++
++    std::vector<float> sample_head;
++    std::vector<float> sample_tail;
++    std::vector<float> full_values;   // populated only if dump_full_values
++};
++
++struct layer_profile_entry {
++    int         layer_index = -1;
++    std::string output_tensor_name;
++
++    int64_t tensor_count  = 0;
++    int64_t call_count    = 0;
++    int64_t total_time_us = 0;
++
++    layer_profile_stats output;
++
++    // Random-subsample buffer populated when csv_dir is configured.
++    // `csv_indices` is generated once on the first output capture and
++    // then reused across forward passes; `csv_values` holds the most
++    // recently captured values at those indices.
++    std::vector<int64_t> csv_indices;
++    std::vector<float>   csv_values;
++};
++
++struct layer_profiler {
++    layer_profile_config config;
++
++    std::mutex mtx;
++
++    std::unordered_map<int, layer_profile_entry> layers;
++
++    // rolling state used to attribute node wall-time to layers
++    int64_t prev_tensor_time_us = 0;
++    int     prev_tensor_layer   = -2;
++
++    int64_t total_compute_time_us = 0;
++    int64_t n_forward_passes      = 0;
++    int64_t n_layer_max           = 0;
++
++    // Seed used for CSV index sampling. Derived once at install time
++    // from the current hour (0..23) so that every layer in the run
++    // shares the same RNG stream.
++    uint64_t csv_seed = 0;
++};
++
++// Install the profiler on `params`. Replaces any pre-existing
++// params.cb_eval with the layer profiler callback and registers an
++// atexit() handler that writes the JSON report on program shutdown.
++// No-op when params.layer_profile_path is empty.
++void common_layer_profiler_install(common_params & params);
++
++// Manually flush the profiler state to disk. Safe to call multiple times.
++void common_layer_profiler_flush();
++
++// The eval callback. Exposed for unit tests; normal callers should not
++// invoke this directly.
++bool common_layer_profiler_cb_eval(ggml_tensor * t, bool ask, void * user_data);
+diff --git a/docs/layer-profile-schema.md b/docs/layer-profile-schema.md
+new file mode 100644
+index 0000000..875e119
+--- /dev/null
++++ b/docs/layer-profile-schema.md
+@@ -0,0 +1,268 @@
++# Layer Profile Schema (`layer-profile/v1`)
++
++This document specifies a **unified JSON format** for per-layer inference
++profiling output. The goal is to allow inference-engine-agnostic comparison of
++per-layer execution timings and output activations: given the same model,
++tokenizer and prompt, two engines (e.g. `llama.cpp` and another runtime)
++should emit files that follow this schema so that a downstream tool can diff
++them layer-by-layer.
++
++The llama.cpp reference producer lives in
++[`common/layer-profile.{h,cpp}`](../common/layer-profile.cpp) and is activated
++by passing `--layer-profile <path>` to any tool that uses `common_params`
++(e.g. `llama-cli`).
++
++---
++
++## 1. Top-level object
++
++```jsonc
++{
++  "schema":                "layer-profile/v1",
++  "engine":                "llama.cpp",
++  "engine_version":        "b5632",
++  "model_id":              "/models/llama-3-8b-f16.gguf",
++  "device":                "cpu",
++  "dtype":                 "f16",
++  "n_layer":               32,
++  "n_forward_passes":      7,
++  "total_compute_time_us": 123456789,
++  "layers": [ /* array of layer objects, see §2 */ ]
++}
++```
++
++| Field                    | Type    | Required | Description                                                                                                                                          |
++| ------------------------ | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
++| `schema`                 | string  | yes      | Must be the literal `"layer-profile/v1"`. Consumers MUST reject unknown schema strings.                                                              |
++| `engine`                 | string  | yes      | Name of the inference engine that produced the file (e.g. `"llama.cpp"`, `"vllm"`, `"tensorrt-llm"`, `"mlx"`).                                       |
++| `engine_version`         | string  | no       | Free-form version identifier (git hash, release tag, ...).                                                                                           |
++| `model_id`               | string  | yes      | Path, HuggingFace repo id or any other identifier of the underlying model. Consumers SHOULD refuse to diff two files with different `model_id`.     |
++| `device`                 | string  | no       | Execution device (`"cpu"`, `"cuda:0"`, `"metal"`, ...).                                                                                              |
++| `dtype`                  | string  | no       | Dominant compute dtype. Use the same string the engine prints internally (`"f32"`, `"f16"`, `"bf16"`, `"q4_0"`, ...).                                |
++| `n_layer`                | integer | yes      | Number of transformer layers observed during profiling. SHOULD equal `hparams.n_layer`.                                                              |
++| `n_forward_passes`       | integer | yes      | How many forward passes were accumulated into the timings / stats. A single `decode()` on one token is one pass.                                      |
++| `total_compute_time_us`  | integer | yes      | Sum of wall-clock time (microseconds) attributed to the full graph across all recorded forward passes. Equal to the sum of per-layer `total_time_us` only if every graph node could be attributed to a layer. |
++| `layers`                 | array   | yes      | Array of per-layer objects, sorted in ascending order of `layer_index`. See §2.                                                                       |
++
++### 1.1 Identity across engines
++
++For two files produced by different engines to be meaningfully comparable, the
++following MUST be equal:
++
++- `schema`, `n_layer`, `model_id` (or a documented mapping between model ids)
++- the tokenizer and the input prompt used to drive the forward pass
++- the requested output dtype (see §3)
++
++The number of forward passes (`n_forward_passes`) does NOT have to match —
++consumers should compare per-layer averages (`avg_time_us`) when it differs.
++
++---
++
++## 2. Layer object
++
++Each entry in `layers` describes one transformer layer:
++
++```jsonc
++{
++  "layer_index":        0,
++  "output_tensor_name": "l_out-0",
++  "tensor_count":       142,
++  "call_count":         7,
++  "total_time_us":      3421,
++  "avg_time_us":        488.7,
++  "output": { /* tensor-stats object, see §3 */ }
++}
++```
++
++| Field                | Type    | Required | Description                                                                                                                                                                                                                                              |
++| -------------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| `layer_index`        | integer | yes      | 0-indexed transformer layer index.                                                                                                                                                                                                                         |
++| `output_tensor_name` | string  | no       | Name of the tensor that was treated as the layer's final residual output (after the last `add`). For llama.cpp this is typically `"l_out-<il>"`. Engines that don't use named tensors SHOULD emit a human-readable identifier such as `"layer.0.output"`. |
++| `tensor_count`       | integer | yes      | Number of individual graph nodes that were attributed to this layer during profiling.                                                                                                                                                                      |
++| `call_count`         | integer | yes      | Number of times the layer's output tensor was produced (usually equals `n_forward_passes`).                                                                                                                                                                |
++| `total_time_us`      | integer | yes      | Total wall-clock time (microseconds) spent inside this layer, summed across every forward pass.                                                                                                                                                            |
++| `avg_time_us`        | number  | yes      | `total_time_us / call_count`, for convenience.                                                                                                                                                                                                             |
++| `output`             | object  | yes      | Statistics of the layer output tensor captured from the **last** forward pass. See §3.                                                                                                                                                                     |
++
++Layers MUST be sorted by `layer_index` ascending. A layer MAY be omitted from
++the list if nothing was attributed to it (e.g. when the profiler was attached
++mid-way through inference); consumers MUST handle gaps gracefully.
++
++---
++
++## 3. Tensor-stats object
++
++The `output` field of each layer uses this sub-schema. The same shape is
++expected when other engines report intermediate activations.
++
++```jsonc
++{
++  "shape":       [1, 4096, 1, 1],
++  "dtype":       "f32",
++  "n_elements":  4096,
++  "min":         -3.2109,
++  "max":          2.8750,
++  "sum":         12.125,
++  "mean":         0.00296,
++  "std":          0.41234,
++  "l2_norm":     26.3421,
++  "nan_count":    0,
++  "inf_count":    0,
++  "sample_head": [0.013, -0.221, 0.198, 0.004, -0.112, 0.341, 0.007, -0.055],
++  "sample_tail": [-0.089, 0.412, 0.029, -0.004, 0.118, -0.205, 0.002, 0.067],
++  "values":      [ /* optional, full value array — see below */ ]
++}
++```
++
++| Field         | Type          | Required | Description                                                                                                                                                          |
++| ------------- | ------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| `shape`       | int[]         | yes      | Four-element array with the tensor's `ne[0..3]`. Engines with fewer dimensions MUST pad with `1`.                                                                    |
++| `dtype`       | string        | yes      | Dtype name as printed by the engine (`"f32"`, `"f16"`, `"bf16"`, `"q4_0"`, ...). Quantized dtypes are permitted but only the metadata fields below will be populated. |
++| `n_elements`  | integer       | yes      | Product of `shape` entries.                                                                                                                                          |
++| `min`         | number        | yes*     | Minimum non-NaN, non-Inf value. `0` if all elements are non-finite. Not required for quantized dtypes.                                                               |
++| `max`         | number        | yes*     | Maximum non-NaN, non-Inf value. `0` if all elements are non-finite.                                                                                                  |
++| `sum`         | number        | yes*     | Sum of non-NaN, non-Inf values.                                                                                                                                      |
++| `mean`        | number        | yes*     | `sum / valid_count` where `valid_count = n_elements - nan_count - inf_count`.                                                                                        |
++| `std`         | number        | yes*     | Population standard deviation computed over valid values.                                                                                                            |
++| `l2_norm`     | number        | yes*     | √Σxᵢ² over valid values.                                                                                                                                             |
++| `nan_count`   | integer       | yes      | Number of NaN elements.                                                                                                                                              |
++| `inf_count`   | integer       | yes      | Number of ±Inf elements.                                                                                                                                             |
++| `sample_head` | number[]      | yes      | First N flattened values in row-major order. N is controlled by the producer (llama.cpp default: 8, override via `--layer-profile-samples`).                          |
++| `sample_tail` | number[]      | yes      | Last N flattened values in row-major order.                                                                                                                          |
++| `values`      | number[]      | no       | Full flattened value array in row-major order. Present only when the producer was configured to dump full values (llama.cpp: `--layer-profile-full`).                |
++
++\* Fields marked `yes*` are required for float dtypes (`f32`, `f16`, `bf16`).
++For quantized dtypes the producer MAY emit them as `0` or omit them; consumers
++MUST tolerate both.
++
++### 3.1 Float precision
++
++All numeric fields SHOULD be emitted as IEEE-754 doubles in JSON. Producers
++MUST NOT emit `NaN` or `Infinity` literals — those are not valid JSON. Instead,
++non-finite aggregates should be reported via the `nan_count` / `inf_count`
++fields and the corresponding aggregate value should be set to `0`.
++
++### 3.2 Tolerance for cross-engine diffs
++
++When diffing two `layer-profile/v1` files, a reasonable default tolerance for
++`f16` activations is:
++
++| Field     | Absolute tolerance | Relative tolerance |
++| --------- | ------------------ | ------------------ |
++| `mean`    | 1e-4               | 1e-3               |
++| `std`     | 1e-4               | 1e-3               |
++| `l2_norm` | 1e-3               | 1e-3               |
++| `min`/`max` | 1e-3            | 1e-3               |
++| `sample_head[i]`, `sample_tail[i]` | 1e-3 | 1e-3 |
++
++Consumers are free to apply their own tolerances. The producer is not
++responsible for enforcing them.
++
++---
++
++## 4. Producer checklist (for other engines)
++
++If you want to emit the same schema from another engine (e.g. vLLM, TensorRT-LLM,
++MLX, transformers), the minimum work is:
++
++1. **Hook per-graph-node execution.** You need a way to observe each
++   operator or kernel as it runs. In llama.cpp this is
++   `ggml_backend_sched_eval_callback`; in PyTorch you can use
++   `torch.nn.Module` forward hooks or CUDA events; in JAX you can use
++   `jax.profiler`.
++2. **Attribute each node to a layer.** The llama.cpp reference producer
++   parses the tensor name suffix (`<base>-<il>`). Other engines typically
++   know the layer index directly from the module path
++   (e.g. `model.layers.13.mlp`).
++3. **Measure wall time.** Record `t0 = now()` before the kernel launches and
++   `t1 = now()` after it completes. Accumulate `t1 - t0` into
++   `layer.total_time_us`.
++4. **Capture the layer output tensor stats.** At the final residual add of
++   each layer, compute the tensor-stats object (§3). Copy the tensor to host
++   memory if it lives on an accelerator.
++5. **Write the JSON file at shutdown.** Use ordered keys, UTF-8, 2-space
++   indentation. llama.cpp registers `std::atexit` for this; a Python reference
++   implementation would use `atexit.register(...)`.
++
++See [`common/layer-profile.cpp`](../common/layer-profile.cpp) for a
++concrete implementation (≈ 330 lines).
++
++---
++
++## 5. Side-channel: per-layer CSV value dumps
++
++In addition to the JSON profile, the llama.cpp producer can emit a
++separate per-layer CSV dump triggered by `--layer-values-csv DIR`. This is
++independent of the JSON output: either, both or neither may be enabled on
++the same run.
++
++For every transformer layer observed, the producer writes a file
++`<DIR>/layer_<il>.csv` (3-digit zero-padded `il`) with exactly two
++columns and up to **300** data rows:
++
++```
++index,value
++17,0.4213
++91,-1.8809
++...
++```
++
++- `index` is the flattened row-major offset into the layer's output
++  tensor (`l_out-<il>`).
++- `value` is the dequantized `f32` value at that offset.
++- Rows are sorted in **ascending `index` order**, so two CSVs with the
++  same sample set line up row-by-row for easy `diff`ing.
++
++**Sampling procedure.** The producer:
++
++1. Derives a RNG seed from the current local hour
++   (`localtime(now).tm_hour`, range `0..23`). Two profiling runs started
++   in the same clock hour therefore reuse the same sample positions,
++   which makes CSV outputs directly diffable between nearby runs on the
++   same model.
++2. **Small-tensor fallback.** If the layer output tensor has fewer than
++   or equal to `n_samples = 300` elements, the producer skips the RNG
++   entirely and emits every position `0..n_elements-1` in natural
++   order. The CSV has exactly `n_elements` data rows in that case.
++3. **Otherwise**, uses the seed to draw `n_samples` **unique** indices
++   uniformly from `[0, n_elements)` with a 64-bit Mersenne Twister
++   (`std::mt19937_64`) and rejection sampling (redraw on collision).
++4. Sorts the resulting index list in ascending order so the CSV rows
++   are line-by-line comparable between runs and between engines.
++5. On every forward pass, re-reads the layer output at those positions
++   and overwrites the stored values, so the final CSV reflects the last
++   observed forward pass.
++
++Consumers that want to cross-check two engines can use the CSV files
++directly: given that both engines sampled the same indices (because the
++schema below is reproducible across engines that follow it), element-wise
++diffs are straightforward.
++
++### 5.1 Cross-engine contract
++
++For another engine to produce a compatible `layer_<il>.csv`:
++
++- It MUST use the same draw procedure: seed = current local hour, RNG =
++  `std::mt19937_64`. When `n_elements > 300`, draw 300 **unique**
++  indices in `[0, n_elements)` via rejection sampling. When
++  `n_elements <= 300`, use the natural range `0..n_elements-1`.
++- It MUST sort the final index list in ascending order before writing
++  the CSV so rows align between producers.
++- It MUST use flattened row-major indices into a tensor of the same
++  `shape` as the corresponding JSON layer object.
++- It MUST emit the header row literally as `index,value` and use a plain
++  comma separator with no quoting.
++- It SHOULD emit values with enough precision to survive an `f16` round
++  trip (≥ 6 significant digits).
++
++Any deviation from the above makes the CSV files non-comparable.
++
++## 6. Versioning
++
++Future non-backwards-compatible changes MUST bump the schema string, e.g.
++`layer-profile/v2`. Backwards-compatible additions (new optional fields) do
++NOT require a version bump but SHOULD be documented in this file.
++
++Schema version history:
++
++- `layer-profile/v1` — initial release (2026-04-11).
+diff --git a/job-to-do.md b/job-to-do.md
+new file mode 100644
+index 0000000..f202673
+--- /dev/null
++++ b/job-to-do.md
+@@ -0,0 +1,343 @@
++# Job-to-do: Per-layer profiling for llama.cpp
++
++## 1. Goal
++
++Add a way to, for every transformer layer that `llama.cpp` executes:
++
++1. Measure the wall-clock time spent inside that layer, and
++2. Capture the value of the layer's output tensor (summary statistics and,
++   optionally, the full value array),
++
++and write both into a **JSON file with a unified, cross-engine schema** so
++that the same information produced by another inference engine (vLLM,
++TensorRT-LLM, MLX, ...) can be diffed against `llama.cpp` layer-by-layer.
++
++The work is delivered as:
++
++- source changes on branch `claude/llamacpp-layer-profiling-xmqUf`,
++- a self-contained patch file (`docs/patches/layer-profile.patch`),
++- a schema specification (`docs/layer-profile-schema.md`),
++- this write-up.
++
++## 2. Files added
++
++| File | Purpose |
++| ---- | ------- |
++| `common/layer-profile.h` | Profiler data structures and public API. |
++| `common/layer-profile.cpp` | Profiler implementation (callback, statistics, JSON emission, atexit flush). |
++| `docs/layer-profile-schema.md` | Full specification of the `layer-profile/v1` JSON schema so other engines can produce the same format. |
++| `docs/patches/layer-profile.patch` | Standalone `git diff` patch that applies cleanly on top of llama.cpp master. |
++| `job-to-do.md` | This document. |
++
++## 3. Files modified
++
++| File | Change |
++| ---- | ------ |
++| `common/common.h` | Added four fields on `common_params`: `layer_profile_path`, `layer_profile_full`, `layer_profile_samples`, `layer_values_csv_dir`. |
++| `common/arg.cpp` | Registered four new CLI flags: `--layer-profile`, `--layer-profile-full`, `--layer-profile-samples`, `--layer-values-csv`. |
++| `common/common.cpp` | Call `common_layer_profiler_install(params)` at the top of `common_init_from_params`, before the `llama_context` is constructed. |
++| `common/CMakeLists.txt` | Added `layer-profile.cpp` / `layer-profile.h` to the `common` static library. |
++
++## 4. How it works
++
++### 4.1 Hook point
++
++llama.cpp already exposes a per-node graph execution hook via
++`ggml_backend_sched_eval_callback`, surfaced on the public `common_params`
++struct as `cb_eval` / `cb_eval_user_data`, and already wired through
++`common_context_params_from_params` into `llama_cparams`. The layer profiler
++reuses this callback — no ggml or `llama_context` changes are required.
++
++The scheduler calls the eval callback twice per graph node:
++
++- `ask=true`: the scheduler asks whether the callback wants this node's data.
++  Returning `true` triggers the backend to synchronize and copy the tensor to
++  host memory.
++- `ask=false`: the node has finished executing; `t->data` (or the backend
++  buffer) is safe to read.
++
++The profiler does all its work on the `ask=false` pass.
++
++### 4.2 Attributing time to layers
++
++Graph nodes in llama.cpp are tagged with names like `<base>-<il>` (see
++`llama_context::graph_get_cb` in `src/llama-context.cpp`), where `<il>` is
++the transformer layer index. For example the final residual output of
++layer 13 in the LLaMA graph builder is called `l_out-13`.
++
++Given that naming convention, the profiler's eval callback does the
++following on every `ask=false` pass:
++
++1. Read the current wall-clock time `now = ggml_time_us()`.
++2. Attribute `now - prev_tensor_time_us` to the **previous** node's layer
++   (since the previous node has just finished executing by the time we see
++   this pass).
++3. Parse the current tensor's layer index by looking at its name suffix.
++4. If the tensor's base name is `l_out` or `ffn_out` (the two tensor names
++   used by llama.cpp model builders for the final per-layer residual
++   output), record its statistics as the layer's output snapshot.
++5. Save `(prev_tensor_layer, prev_tensor_time_us) = (il, now)`.
++
++Across multiple forward passes the profiler accumulates total time per
++layer, counts the number of times each layer's output was observed, and
++keeps the statistics of the most recent output.
++
++### 4.3 Statistics captured per layer output
++
++Implemented in `capture_layer_output()` in `common/layer-profile.cpp`:
++
++- `shape` — `ne[0..3]`.
++- `dtype` — the ggml type name (`f32`, `f16`, `bf16`, `q4_0`, ...).
++- `n_elements` — `ggml_nelements(t)`.
++- `min`, `max`, `sum`, `mean`, `std`, `l2_norm` — computed over all non-NaN,
++  non-Inf values.
++- `nan_count`, `inf_count`.
++- `sample_head`, `sample_tail` — first/last N flattened values
++  (N is configurable via `--layer-profile-samples`, default 8).
++- `values` — optional, full flattened value array, populated only when
++  `--layer-profile-full` is passed.
++
++For quantized dtypes only `shape`, `dtype` and `n_elements` are captured to
++keep the implementation small; statistics would require dequantization which
++is out of scope for this patch.
++
++Tensors that live on non-host backends are copied to a staging buffer via
++`ggml_backend_tensor_get` before being read (the same pattern used by
++`common/debug.cpp`).
++
++### 4.4 Installation and lifecycle
++
++`common_layer_profiler_install(params)` is called at the top of
++`common_init_from_params`, before `new common_init_result(params)` creates
++the `llama_context`. This is important: `cb_eval` must be set on
++`common_params` before it is copied into `llama_context_params` and stored
++on the context. The install function:
++
++1. No-ops if both `params.layer_profile_path` and
++   `params.layer_values_csv_dir` are empty.
++2. Allocates a singleton `layer_profiler` held in a file-static
++   `std::unique_ptr`.
++3. Sets `params.cb_eval` to the profiler callback and
++   `params.cb_eval_user_data` to the singleton pointer.
++4. Registers `std::atexit(common_layer_profiler_atexit)` exactly once.
++
++The atexit handler calls `common_layer_profiler_flush()` which serializes
++the accumulated data to the configured JSON path using `nlohmann::json`
++(already a build-time dependency of `common`).
++
++### 4.5 CLI surface
++
++```
++--layer-profile FNAME
++    write per-layer timing and output statistics to FNAME as JSON
++    (schema: layer-profile/v1, see docs/layer-profile-schema.md)
++
++--layer-profile-full
++    also record full per-layer output values in the layer profile JSON
++    (warning: large output)
++
++--layer-profile-samples N
++    number of head/tail sample values to record per layer output in the
++    layer profile JSON (default: 8)
++
++--layer-values-csv DIR
++    write one CSV file per layer (layer_<il>.csv) with up to 300
++    randomly sampled output values to DIR; sampling uses a seed
++    derived from the current hour and draws unique indices. If a
++    layer output has fewer than 300 elements, all values are dumped.
++```
++
++Because the flags are attached to the default example group (i.e. no
++`.set_examples({...})`), they are available on every llama.cpp tool that
++uses `common_params` — `llama-cli`, `llama-perplexity`, `llama-bench`,
++`llama-server`, etc.
++
++Typical invocation:
++
++```
++./build/bin/llama-cli \
++    -m /models/llama-3-8b.gguf \
++    -p "The quick brown fox" \
++    -n 1 \
++    --layer-profile layer-profile.json
++```
++
++which produces `layer-profile.json` with the `layer-profile/v1` schema.
++
++## 4.6 Per-layer CSV value dumps (`--layer-values-csv`)
++
++Separately from the JSON profile, the profiler can write one CSV file
++per layer containing randomly sampled output values. This is enabled by
++a single new flag:
++
++```
++--layer-values-csv DIR
++```
++
++Either `--layer-profile` (JSON), `--layer-values-csv` (CSV), or both
++may be used on the same run — they are independent outputs.
++
++### Sampling procedure
++
++- RNG seed = current local hour (`localtime(now).tm_hour`, range 0..23).
++- RNG = `std::mt19937_64` seeded with that value.
++- If the layer output has `<= 300` elements, every position is dumped
++  in natural `0..n_elements-1` order (no RNG involved).
++- Otherwise, draw **300 unique** indices uniformly from
++  `[0, n_elements)` via rejection sampling (redraw on collision). Every
++  CSV row corresponds to a distinct tensor position.
++- The final index list is **sorted in ascending order** before the
++  first value is written, so every `layer_<il>.csv` has rows in
++  monotonically increasing `index` order and two runs can be diffed
++  line-by-line.
++- The index list is generated once per layer on the first output
++  observation and cached on the layer entry, so subsequent forward
++  passes reuse the same indices.
++- On every forward pass, the values at those positions are re-read from
++  the tensor and overwritten in the profiler state, so the final CSV
++  reflects the **last** observed forward pass.
++
++The `csv_n_samples` knob lives on `layer_profile_config` if a reviewer
++wants to tweak the sample count without touching the callsite.
++
++### File layout
++
++For each observed layer, one file is written to `DIR`:
++
++```
++DIR/
++    layer_000.csv
++    layer_001.csv
++    ...
++    layer_031.csv
++```
++
++Each file contains exactly one header row plus up to 300 data rows
++(`min(n_elements, 300)` exactly):
++
++```
++index,value
++17,0.4213
++91,-1.8809
++...
++```
++
++where `index` is the row-major flattened offset into the layer's output
++tensor and `value` is the dequantized `f32` value at that offset.
++
++### Seed rationale
++
++Using the current hour as a seed means:
++
++- Runs within the same hour pick the same indices → the CSV files are
++  directly diffable across runs without extra configuration.
++- Runs in different hours pick different indices → the sampled coverage
++  rotates across the tensor over time so that failures that depend on
++  specific positions still have a chance of being hit.
++
++This matches the sampling strategy the user explicitly asked for
++(300 uniform indices per layer) and is documented in the schema doc
++(`docs/layer-profile-schema.md` §5) so other engines can reproduce
++the exact same sampling.
++
++## 5. Output schema (summary)
++
++Full spec lives in `docs/layer-profile-schema.md`. Briefly:
++
++```jsonc
++{
++  "schema":                "layer-profile/v1",
++  "engine":                "llama.cpp",
++  "engine_version":        "...",
++  "model_id":              "/path/to/model.gguf",
++  "device":                "cpu",
++  "dtype":                 "f16",
++  "n_layer":               32,
++  "n_forward_passes":      7,
++  "total_compute_time_us": 123456789,
++  "layers": [
++    {
++      "layer_index":        0,
++      "output_tensor_name": "l_out-0",
++      "tensor_count":       142,
++      "call_count":         7,
++      "total_time_us":      3421,
++      "avg_time_us":        488.7,
++      "output": {
++        "shape":       [1, 4096, 1, 1],
++        "dtype":       "f32",
++        "n_elements":  4096,
++        "min":         -3.2109,
++        "max":          2.8750,
++        "sum":         12.125,
++        "mean":         0.00296,
++        "std":          0.41234,
++        "l2_norm":     26.3421,
++        "nan_count":    0,
++        "inf_count":    0,
++        "sample_head": [...],
++        "sample_tail": [...]
++      }
++    }
++    /* ... one object per layer, sorted ascending ... */
++  ]
++}
++```
++
++## 6. How another inference engine reproduces the format
++
++`docs/layer-profile-schema.md` has a dedicated "Producer checklist" section.
++The minimal steps are:
++
++1. Hook per-graph-node execution (e.g. PyTorch forward hooks, CUDA events,
++   JAX profiler).
++2. Attribute each node to a layer (engines that know layer indices directly
++   from module paths can skip llama.cpp's name-suffix parsing trick).
++3. Measure wall time per node and accumulate into `layer.total_time_us`.
++4. At the final residual of each layer, compute the same statistics object
++   (§3 of the schema).
++5. Serialize on shutdown with ordered keys and UTF-8.
++
++## 7. What was built and verified
++
++- [x] Source compiles cleanly (`cmake --build build --target common -j$(nproc)`
++      succeeds, including `common/layer-profile.cpp`).
++- [x] `libcommon.a` links into the rest of the llama.cpp build.
++- [x] Patch file `docs/patches/layer-profile.patch` is complete and
++      self-contained (`git apply --check` passes on a clean checkout).
++- [ ] **Not verified end-to-end:** a real inference run with
++      `--layer-profile` producing a populated JSON file. This requires a
++      GGUF model to be available at runtime, which is outside the scope of
++      the harness used to author this patch. The reviewer SHOULD run
++      `llama-cli --layer-profile ...` against a small model before shipping.
++
++## 8. Known limitations and follow-ups
++
++- **Layer timing is approximate.** The eval callback observes graph nodes
++  after the backend reports them, not hardware-exact kernel intervals.
++  For more precise GPU timings on CUDA/Metal/Vulkan one could pair this
++  with backend-native events (e.g. `cudaEventRecord`). Left as future work.
++- **Only `l_out` and `ffn_out` are recognized as layer outputs.** A few
++  exotic model builders in `src/models/` may name the final residual
++  differently; those layers will have timing data but an empty `output`
++  object. A simple fix is to additionally recognize `result_norm` etc. —
++  left for follow-up once concrete models are identified.
++- **Quantized tensors are not dequantized.** Only shape/dtype/n_elements
++  are reported for them. Full statistics would require reusing the
++  dequantization paths in `ggml-quants.c`.
++- **`common/debug.cpp` already installs a debug eval callback.** If both
++  `--layer-profile` and the existing debug flags (`--save-logits`,
++  `--tensor-filter`) are used together, the layer profiler currently wins
++  (and logs a warning). If both are wanted simultaneously, a chaining
++  callback would need to be introduced.
++
++## 9. Summary of the deliverables
++
++| Deliverable | Location |
++| ----------- | -------- |
++| Patch file | `docs/patches/layer-profile.patch` |
++| Schema spec (for other engines) | `docs/layer-profile-schema.md` |
++| Source: profiler header | `common/layer-profile.h` |
++| Source: profiler implementation | `common/layer-profile.cpp` |
++| Source: CLI + wiring | `common/common.h`, `common/arg.cpp`, `common/common.cpp`, `common/CMakeLists.txt` |
++| Write-up | `job-to-do.md` (this file) |
