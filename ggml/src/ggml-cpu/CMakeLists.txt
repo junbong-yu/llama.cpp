@@ -583,6 +583,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_REPACK)
     endif()
 
+    if (GGML_CPU_CUSTOM_KERNELS)
+        message(STATUS "Using custom kernel module for A/B benchmarking")
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_CUSTOM_KERNELS)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/custom-kernels/custom-kernels.cpp
+            ggml-cpu/custom-kernels/custom-kernels.h
+        )
+    endif()
+
     if (GGML_CPU_KLEIDIAI)
         message(STATUS "Using KleidiAI optimized kernels if applicable")
 
